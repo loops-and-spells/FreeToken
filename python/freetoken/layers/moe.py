@@ -397,6 +397,29 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
+        # Small prefill (short prompt, or a radix-hit re-prefill of a few tokens):
+        # the routed ids touch far fewer experts than the layer holds, so streaming
+        # the WHOLE layer (num_experts x row bytes -- ~4 GB/layer on GLM-5.3) is a
+        # 100x overspend. Fetch only the routed experts through the decode-style LRU
+        # path instead; the crossover is where the routed count reaches the layer
+        # size (dedup caps unique experts at num_experts anyway).
+        if (
+            topk_ids.numel() < self.num_experts
+            and cache.device.type == "cuda"  # the LRU slot kernel is triton
+            and not cache.is_cpu_layer(self.layer_id)
+        ):
+            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(
