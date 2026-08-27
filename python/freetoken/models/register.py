@@ -122,6 +122,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
     ),
+    # GLM-5.3-Flash (model_type glm5_next): hybrid KDA linear attention + NoPE
+    # sparse MLA with a k-pool-compressed DSA indexer, mHC residual streams, and
+    # GLM-5.2-style sigmoid MoE routing; block-fp8 routed experts served from the
+    # offload cache. Text-only (the vision tower is dropped).
+    "Glm5NextForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm_5_3",
+        "Glm5NextForConditionalGeneration",
+    ),
 }
 
 

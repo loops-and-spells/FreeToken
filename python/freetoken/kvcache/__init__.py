@@ -194,6 +194,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=mla_layer_ids,
+                index_gate_dim=spec.index_gate_dim,
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,

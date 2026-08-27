@@ -29,7 +29,10 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         * config.dtype.itemsize
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2
+    # index_gate_dim: the k-pool gate-score slab (GLM-5.3 DSA pool compression) rides
+    # the index layers at the same bf16 accounting as the index-key slab.
+    aux = getattr(spec, "index_gate_dim", 0)
+    return per_token + (spec.index_head_dim + aux) * spec.num_index_layers * 2
 
 
 class BaseKVCachePool(ABC):

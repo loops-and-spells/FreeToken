@@ -173,13 +173,15 @@ class DSAKVCache(MLAKVCache):
         index_head_dim: int,
         num_index_layers: int,
         layer_ids: Sequence[int] | None = None,
+        index_gate_dim: int = 0,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
+        self._index_gate_dim = index_gate_dim
         super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device, layer_ids)
 
     def _alloc(self, num_pages: int) -> None:
-        # Both slabs in one allocation step: rebuild can never leave the pool with a
+        # All slabs in one allocation step: rebuild can never leave the pool with a
         # grown latent slab and a stale index slab (the OOB class this type exists for).
         super()._alloc(num_pages)
         # bf16 == the 2 bytes/token/layer the KV cost model budgets for this slab
@@ -191,18 +193,36 @@ class DSAKVCache(MLAKVCache):
             dtype=torch.bfloat16,
             device=self._device,
         )
+        # k-pool gate scores (GLM-5.3 pool-compressed DSA): one row per token per index
+        # layer, consumed with the index keys to recompute pooled keys at selection time.
+        self._index_gate_buffer = (
+            torch.zeros(
+                self._num_index_layers,
+                num_pages * self._page_size,
+                self._index_gate_dim,
+                dtype=torch.bfloat16,
+                device=self._device,
+            )
+            if self._index_gate_dim > 0
+            else None
+        )
 
     def rebuild(self, num_pages: int) -> None:
         self._index_k_buffer = None
+        self._index_gate_buffer = None
         super().rebuild(num_pages)
 
     def unit_bytes(self) -> tuple[int, int]:
-        # The index slab rides the same token budget as the latent slab; each slab's per-token
-        # cost is floor-divided on its own, matching the cost model's two separate terms.
+        # The index slabs ride the same token budget as the latent slab; each slab's per-token
+        # cost is floor-divided on its own, matching the cost model's separate terms.
         kv, swa = super().unit_bytes()
         idx = self._index_k_buffer
         tokens = self._num_pages * self._page_size
-        return kv + int(idx.numel() * idx.element_size()) // tokens, swa
+        kv += int(idx.numel() * idx.element_size()) // tokens
+        if self._index_gate_buffer is not None:
+            g = self._index_gate_buffer
+            kv += int(g.numel() * g.element_size()) // tokens
+        return kv, swa
 
     def index_k_cache(self, slot: int) -> torch.Tensor:
         """Row-flat index keys for a full-indexer layer slot: ``[rows, index_head_dim]``."""
@@ -210,6 +230,15 @@ class DSAKVCache(MLAKVCache):
 
     def store_index_k(self, k: torch.Tensor, out_loc: torch.Tensor, slot: int) -> None:
         self._index_k_buffer[slot][out_loc] = k
+
+    def index_gate_cache(self, slot: int) -> torch.Tensor:
+        """Row-flat k-pool gate scores for an index layer slot: ``[rows, index_gate_dim]``."""
+        assert self._index_gate_buffer is not None, "pool was built without a gate slab"
+        return self._index_gate_buffer[slot]
+
+    def store_index_gate(self, g: torch.Tensor, out_loc: torch.Tensor, slot: int) -> None:
+        assert self._index_gate_buffer is not None, "pool was built without a gate slab"
+        self._index_gate_buffer[slot][out_loc] = g
 
 
 __all__ = ["MLAKVCache", "DSAKVCache"]

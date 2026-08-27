@@ -97,6 +97,9 @@ class KVCacheGroupSpec:
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
+    # k-pool gate-score slab width (GLM-5.3 DSA pool compression): one bf16
+    # ``index_gate_dim`` row per token per index layer, alongside the index keys.
+    index_gate_dim: int = 0
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
@@ -134,6 +137,7 @@ class FullAttentionGroupConfig(BaseAttentionGroupConfig):
     mla: bool = False
     index_head_dim: int = 0
     num_index_layers: int = 0
+    index_gate_dim: int = 0
 
 
 @dataclass(frozen=True)
@@ -409,6 +413,7 @@ class ModelConfig:
                         mla=group.mla,
                         index_head_dim=group.index_head_dim,
                         num_index_layers=group.num_index_layers,
+                        index_gate_dim=group.index_gate_dim,
                         attn_type=_full_group_attn_type(group),
                     )
                 )

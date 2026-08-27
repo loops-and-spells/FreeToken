@@ -254,6 +254,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # GLM-5.3-Flash: hybrid KDA + NoPE sparse MLA; the latent store scatters
+        # via index_put_ (same as GLM-5.2 above), so no paged-KV store groups.
+        name="zai-org/GLM-5.3-Flash",
+        architecture="Glm5NextForConditionalGeneration",
+        hidden_size=4096,
+        kv_groups=(),
+        top_k=8,
+        moe_intermediate_size=2048,
+        expert_formats=("fp8_block",),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.

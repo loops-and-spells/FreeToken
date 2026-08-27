@@ -98,11 +98,18 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         # so a checkpoint with a malformed list cannot crash the ablation.
         self._leader: Dict[int, int] = {}
         self._idx_slot: Dict[int, int] = {}
+        # k-pool compression (GLM-5.3): the indexer scores pools of ``index_kpool``
+        # tokens instead of individual tokens. 1 == the GLM-5.2 token-granular path.
+        self.index_kpool = int(getattr(args, "index_kpool", 1) or 1)
         if self.dsa_enabled:
             lead = None
             # Capped to the SERVED layer count (dev num_layers overrides must not
             # index slots past the pool the factory sized from the same cap).
             for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
+                if kind == "linear":
+                    # Hybrid models (GLM-5.3): linear-attention layers never reach
+                    # this backend -- no slot, no leader.
+                    continue
                 if kind == "full":
                     lead = lid
                     self._idx_slot[lid] = len(self._idx_slot)
@@ -178,12 +185,85 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             # Scatter index keys unconditionally: short prefills serve through the
             # identity path TODAY, but their keys must exist once decode passes topk.
             self.kvcache.store_index_k(indexer_qkw[1], batch.out_loc, self._idx_slot[layer_id])
+            if self.index_kpool > 1:
+                # k-pool gate scores ride their own slab: pooled keys are recomputed
+                # from (keys, gates) at selection time, so history gates must exist.
+                self.kvcache.store_index_gate(
+                    indexer_qkw[3], batch.out_loc, self._idx_slot[layer_id]
+                )
 
         if md.is_decode:
             return self._decode(md, layer_id, q_nope, q_pe, indexer_qkw)
         return self._prefill(md, layer_id, q_nope, q_pe, batch, indexer_qkw)
 
+    # ----- k-pool compressed selection (GLM-5.3) ----------------------------------------
+    def _kpool_pooled_keys(
+        self, slot: int, rows: torch.Tensor, num_pools: int, ape: torch.Tensor
+    ) -> torch.Tensor:
+        """Pooled index keys ``[bs, P, D]`` recomputed from the key + gate slabs.
+
+        ``rows`` [bs, W] position-ordered physical rows (-1 padded). Pool ``p`` covers
+        positions ``[p*kp, (p+1)*kp)``; its key is the channel-wise softmax(gate + ape)
+        weighted mean of its member keys (the HF reference's get_pooled_states).
+        Garbage pools (past each request's live length) are finite and masked -inf by
+        the caller's selection, never read.
+
+        ponytail: gathers the full key+gate history every step; a cached pooled-key
+        slab (incremental writes) or a fused gather-pool-score kernel halves the
+        traffic if kpool decode ever dominates.
+        """
+        kp = self.index_kpool
+        flat = rows[:, : num_pools * kp].clamp_min(0).long()  # [bs, P*kp]
+        keys = self.kvcache.index_k_cache(slot)[flat]  # [bs, P*kp, D]
+        gates = self.kvcache.index_gate_cache(slot)[flat]
+        bs = rows.shape[0]
+        keys = keys.view(bs, num_pools, kp, -1).float()
+        logits = gates.view(bs, num_pools, kp, -1).float() + ape.float()[None, None]
+        weights = torch.softmax(logits, dim=2)
+        return (weights * keys).sum(dim=2)  # [bs, P, D] fp32
+
+    def _kpool_expand(self, picks: torch.Tensor, tail_start: torch.Tensor,
+                      visible: torch.Tensor) -> torch.Tensor:
+        """Selected pool ids -> token POSITIONS, tail pool appended.
+
+        ``picks`` [..., K] pool ids (-1 sentinel), ``tail_start`` / ``visible``
+        broadcastable to picks' leading dims: first position of the incomplete tail
+        pool and the visible token count. Returns [..., K*kp + kp] positions with -1
+        holes (the sparse kernel masks them)."""
+        kp = self.index_kpool
+        ar = torch.arange(kp, device=picks.device, dtype=picks.dtype)
+        shape = picks.shape
+        tokens = picks.unsqueeze(-1) * kp + ar  # [..., K, kp]
+        tokens = torch.where(picks.unsqueeze(-1) < 0, -1, tokens).view(*shape[:-1], -1)
+        # always-select-tail: the incomplete pool's tokens (empty when len % kp == 0)
+        tail = tail_start.unsqueeze(-1) + ar  # [..., kp]
+        tail = torch.where(tail < visible.unsqueeze(-1), tail, -1)
+        return torch.cat([tokens, tail.to(tokens.dtype)], dim=-1)
+
     # ----- decode (CUDA-graph capturable, single code path) -----------------------------
+    def _decode_select_kpool(self, md, layer_id, q_idx, w, ape) -> tuple:
+        rows, kvlen = md.rows, md.kvlen
+        bs = rows.shape[0]
+        kp = self.index_kpool
+        num_pools = rows.shape[1] // kp
+        pooled = self._kpool_pooled_keys(self._idx_slot[layer_id], rows, num_pools, ape)
+        # head-reduced pool logits: sum_h w_h * relu(q_h . pooled_k_p), fp32
+        logits = torch.relu(torch.einsum("bhd,bpd->bhp", q_idx.float(), pooled))
+        s = (logits * (w.float() * self.index_scale).unsqueeze(-1)).sum(dim=1)  # [bs, P]
+        valid_pools = torch.div(kvlen, kp, rounding_mode="floor")
+        # Garbage pools past each request's live length must lose the top-k (the
+        # token-granular path gets this from the scoring kernel's in-kernel -inf).
+        pool_ids = torch.arange(num_pools, device=s.device).unsqueeze(0)
+        s = s.masked_fill(pool_ids >= valid_pools.unsqueeze(-1), float("-inf"))
+        k_pools = min(max(self.index_topk // kp, 1), num_pools)
+        picks = self.indexer_select_decode(
+            s.view(bs, 1, -1), valid=valid_pools, topk=k_pools, offset=0
+        )[:, 0]  # [bs, K] pool ids, -1 sentinel
+        positions = self._kpool_expand(picks, tail_start=valid_pools * kp, visible=kvlen)
+        sel = self.dsa_map_rows(positions, rows).view(bs, 1, -1)
+        cnt = torch.full_like(kvlen, sel.shape[-1]).view(bs, 1)
+        return sel, cnt
+
     def _decode(self, md, layer_id, q_nope, q_pe, indexer_qkw) -> torch.Tensor:
         bs = q_nope.shape[0]
         rows, kvlen = md.rows, md.kvlen
@@ -193,14 +273,18 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             sel, cnt = rows.view(bs, 1, -1), kvlen.view(bs, 1)
         else:
             if indexer_qkw is not None:
-                q_idx, _, w = indexer_qkw
-                s = self.dsa_decode_scores(q_idx, w, self._idx_slot[layer_id], rows, kvlen)
-                k_sel = min(self.index_topk, s.shape[-1])
-                picks = self.indexer_select_decode(
-                    s.view(bs, 1, -1), valid=kvlen, topk=k_sel, offset=0
-                )[:, 0]  # [bs, K] positions, -1 sentinel
-                sel = self.dsa_map_rows(picks, rows).view(bs, 1, -1)
-                cnt = torch.clamp(kvlen, max=k_sel).to(torch.int32).view(bs, 1)
+                if self.index_kpool > 1:
+                    q_idx, _, w, _gate, ape = indexer_qkw
+                    sel, cnt = self._decode_select_kpool(md, layer_id, q_idx, w, ape)
+                else:
+                    q_idx, _, w = indexer_qkw
+                    s = self.dsa_decode_scores(q_idx, w, self._idx_slot[layer_id], rows, kvlen)
+                    k_sel = min(self.index_topk, s.shape[-1])
+                    picks = self.indexer_select_decode(
+                        s.view(bs, 1, -1), valid=kvlen, topk=k_sel, offset=0
+                    )[:, 0]  # [bs, K] positions, -1 sentinel
+                    sel = self.dsa_map_rows(picks, rows).view(bs, 1, -1)
+                    cnt = torch.clamp(kvlen, max=k_sel).to(torch.int32).view(bs, 1)
                 # Only the live group leader's selection is ever read again.
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
@@ -210,6 +294,57 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 
     # ----- prefill / extend (eager) ------------------------------------------------------
+    def _select_prefill_kpool(
+        self, slot: int, q_idx: torch.Tensor, w: torch.Tensor, ape: torch.Tensor,
+        rows: torch.Tensor, positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-request causal top-k over POOLS, expanded back to token rows:
+        ([1, m, K*kp + kp] physical rows with -1 holes, [1, m] counts)."""
+        kp = self.index_kpool
+        kv_len = rows.numel()
+        num_pools = kv_len // kp
+        m = q_idx.shape[0]
+        start_pos = int(positions[0])
+        k_pools = min(max(self.index_topk // kp, 1), max(num_pools, 1))
+        width = k_pools * kp + kp
+        sel = torch.full((m, width), -1, dtype=torch.int32, device=self.device)
+        visible = (positions + 1).to(torch.int64)  # [m]
+        tail_start = torch.div(visible, kp, rounding_mode="floor") * kp
+        if num_pools > 0:
+            pooled = self._kpool_pooled_keys(
+                slot, rows.view(1, -1), num_pools, ape
+            )[0]  # [P, D] fp32
+            # Bound the fp32 [chunk, P] logits transient like the token-granular path.
+            chunk = max(16, min(_PREFILL_SCORE_CHUNK,
+                                _PREFILL_SCORE_BYTES // max(num_pools * 4, 1)))
+            for s0 in range(0, m, chunk):
+                s1 = min(s0 + chunk, m)
+                logits = torch.relu(
+                    torch.einsum("thd,pd->thp", q_idx[s0:s1].float(), pooled)
+                )
+                scores = (logits * (w[s0:s1].float() * self.index_scale).unsqueeze(-1)).sum(dim=1)
+                picks = self.indexer_select_prefill(
+                    scores.unsqueeze(0), start_pos=start_pos + s0, seqlen=s1 - s0,
+                    ratio=kp, topk=k_pools, offset=0,
+                )[0]  # [chunk, K] pool ids, -1 sentinel
+                positions_sel = self._kpool_expand(
+                    picks, tail_start=tail_start[s0:s1], visible=visible[s0:s1]
+                )
+                sel[s0:s1] = self.dsa_map_rows(
+                    positions_sel, rows.view(1, -1).expand(s1 - s0, -1)
+                )
+        else:
+            # Context shorter than one pool: tail-only selection (== dense).
+            positions_sel = self._kpool_expand(
+                torch.full((m, 1), -1, dtype=torch.int64, device=self.device),
+                tail_start=tail_start, visible=visible,
+            )
+            sel[:, : positions_sel.shape[-1]] = self.dsa_map_rows(
+                positions_sel, rows.view(1, -1).expand(m, -1)
+            )
+        cnt = torch.full((m,), width, dtype=torch.int32, device=self.device)
+        return sel.view(1, m, width), cnt.view(1, m)
+
     def _select_prefill(
         self, slot: int, q_idx: torch.Tensor, w: torch.Tensor,
         rows: torch.Tensor, positions: torch.Tensor,
@@ -244,17 +379,29 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         qo = md.qo_indptr_cpu.tolist()
         sparse = self.dsa_enabled and int(md.kv_len_cpu.max()) > self.index_topk
         if sparse and indexer_qkw is not None:
-            q_idx, _, w = indexer_qkw
             md.sel.clear()  # one live group leader at a time
-            md.sel[layer_id] = [
-                self._select_prefill(
-                    self._idx_slot[layer_id],
-                    q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]],
-                    page_table[r.table_idx, : r.device_len],
-                    batch.positions[qo[i] : qo[i + 1]],
-                )
-                for i, r in enumerate(reqs)
-            ]
+            if self.index_kpool > 1:
+                q_idx, _, w, _gate, ape = indexer_qkw
+                md.sel[layer_id] = [
+                    self._select_prefill_kpool(
+                        self._idx_slot[layer_id],
+                        q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]], ape,
+                        page_table[r.table_idx, : r.device_len],
+                        batch.positions[qo[i] : qo[i + 1]],
+                    )
+                    for i, r in enumerate(reqs)
+                ]
+            else:
+                q_idx, _, w = indexer_qkw
+                md.sel[layer_id] = [
+                    self._select_prefill(
+                        self._idx_slot[layer_id],
+                        q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]],
+                        page_table[r.table_idx, : r.device_len],
+                        batch.positions[qo[i] : qo[i + 1]],
+                    )
+                    for i, r in enumerate(reqs)
+                ]
         o = q_cat.new_empty(t, self.num_heads, self.kv_lora_rank)
         for i, r in enumerate(reqs):
             m = qo[i + 1] - qo[i]
