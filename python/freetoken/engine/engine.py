@@ -645,6 +645,17 @@ class Engine:
             requested_residency = self._overlay_device_bank_layers(
                 config, requested_residency, cpu_layer_ids
             )
+            has_device_banks = any(
+                str(r).startswith("device:") for r in (requested_residency or ())
+            )
+            if has_device_banks:
+                # Device banks must land in LEGACY (cudaMalloc) segments: torch's
+                # expandable (VMM) segments are not peer-mappable -- kernels on the
+                # serving device MMU-fault dereferencing them (cudaDeviceEnablePeerAccess
+                # covers only legacy allocations; measured directly). Drop to legacy for
+                # the bank load, restore after -- the serving device's big pools are
+                # already allocated, so fragmentation impact is minimal.
+                torch.cuda.memory._set_allocator_settings("expandable_segments:False")
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
@@ -690,6 +701,8 @@ class Engine:
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            if has_device_banks:
+                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)
