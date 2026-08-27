@@ -24,6 +24,7 @@ import os
 # path, e.g. "/v1/requests?since=123&limit=50").
 _POLLING_PATH_PREFIXES: tuple[str, ...] = (
     "/health",
+    "/ready",
     "/v1/stats",
     "/v1/requests",
     "/v1/cache/status",

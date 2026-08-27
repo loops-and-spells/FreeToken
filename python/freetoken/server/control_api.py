@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -57,6 +58,18 @@ def register_control_routes(
     @app.get("/health")
     async def health():
         return build_health(get_state(), app.version)
+
+    @app.get("/ready")
+    async def ready():
+        """Strict readiness: 200 ONLY when the engine can serve a generation
+        request right now. /health answers 200 through the whole lifecycle
+        (loading/ok/error) -- correct for liveness, but an orchestrator that
+        probes it routes traffic into a still-loading engine. This is the
+        load-balancer/router probe."""
+        doc = build_health(get_state(), app.version)
+        if doc.get("status") == "ok":
+            return doc
+        return JSONResponse(status_code=503, content=doc)
 
     from . import request_ring
 
