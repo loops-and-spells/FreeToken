@@ -53,8 +53,9 @@ layer is not loaded (no speculative decoding in v1).
 * **Full 45-layer serving** (LibertAIDAI/GLM-5.3-Flash-NVFP4, 181 GiB): on a
   single 96 GB serving GPU + a second card holding 22 MoE layers' expert banks
   device-resident (the new multi-device bank placement) + ~76 GiB pinned host
-  RAM. Coherent thinking-mode answers, **~29 tok/s decode** (CUDA graphs,
-  ~24% decode expert-cache miss rate), steady across requests. This checkpoint
+  RAM. Coherent thinking-mode answers, **~38 tok/s decode** (CUDA graphs +
+  peer expert compute; ~29 tok/s without peer compute at ~24% expert-cache
+  miss rate), steady across requests. This checkpoint
   stores per-expert NVFP4 with a separate expert set on the trailing MTP layer,
   which the source spec maps to None (skipped).
 * Full suite: no regressions (the one failing test on my machine,
@@ -85,6 +86,15 @@ welcome from anyone with the RAM.
   decode collapses ~3.7x (measured 8 vs 29 tok/s). The engine holds bank
   devices awake with a tiny periodic kernel (`FREETOKEN_BANK_KEEPALIVE=0` opts
   out when clocks are locked via `nvidia-smi -lmc`).
+* **Peer expert compute** (`FREETOKEN_PEER_EXPERT_COMPUTE=1`): decode a
+  device-bank layer's experts ON the bank device -- its full expert set is
+  resident there, so the layer has no misses and moves no weights; only
+  KB-scale activations cross the bus, and the bank card's local bandwidth does
+  the GEMV. The round trip stays inside the serving device's captured decode
+  graph (event-linked peer stream, all peer-side buffers preallocated -- 
+  capture-time allocations route only to the capture device's pool). Measured:
+  29.6 -> 37.6 tok/s (+27%) with 22 device layers, and the host layers' miss
+  rate drops ~24% -> ~10-19% as the freed LRU slots migrate to them.
 * **Per-layer hybrid decode with device banks**: `--moe-backend hybrid` now
   composes with device banks -- host-resident layers use the hybrid PCIe+CPU
   co-compute, device-bank layers (no host copy) keep the plain GPU offload
