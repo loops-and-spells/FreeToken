@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -630,6 +632,39 @@ class CacheManager:
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+
+    # ----- k=1 speculative decode lookahead (page_size == 1 only) -------------------
+    # The verify forward writes KV one position past the step's own token. The
+    # scheduler allocates that page right before the forward and frees it again
+    # when the draft is rejected, so on accept the layout is indistinguishable
+    # from a vanilla step and every existing alloc/free/caching invariant holds.
+    def allocate_spec_lookahead(self, req: Req) -> None:
+        assert self.page_size == 1, "spec lookahead assumes page_size == 1"
+        assert getattr(req, "spec_lookahead_pos", None) is None, (
+            f"unreleased spec lookahead at {req.spec_lookahead_pos}"
+        )
+        pos = req.device_len  # the verify (draft) token's position
+        page = self._allocate(1)
+        self.page_table[req.table_idx, pos] = page[0]
+        req.spec_lookahead_pos = pos
+        if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
+            logger.info_rank0(
+                f"spec page: alloc pos={pos} page={int(page[0])} "
+                f"free={len(self.free_slots)}"
+            )
+
+    def free_spec_lookahead(self, req: Req) -> None:
+        pos = getattr(req, "spec_lookahead_pos", None)
+        if pos is None:
+            return
+        self._free(self.page_table[req.table_idx, pos : pos + 1])
+        req.spec_lookahead_pos = None
+        if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
+            logger.info_rank0(
+                f"spec page: free pos={pos} "
+                f"page={int(self.page_table[req.table_idx, pos])} "
+                f"free={len(self.free_slots)}"
+            )
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

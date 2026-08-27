@@ -288,6 +288,10 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # k=1 speculative decode: the BONUS token sampled after an accepted draft
+    # ((gpu, cpu) tensors, bs==1 only). The scheduler appends it after the main
+    # token and writes it at token_pool position+1. None on non-spec steps.
+    spec_extra: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class Engine:
@@ -1117,6 +1121,10 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.spec_will_verify(batch):
+            return self._spec_forward(
+                batch, args, self._mtp_pending[batch.reqs[0].uid][1]
+            )
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
@@ -1142,6 +1150,172 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def spec_will_verify(self, batch: Batch) -> bool:
+        """Whether forward_batch will take the k=1 speculative verify path for
+        this batch. The SCHEDULER consults the same predicate before the forward
+        to allocate the verify token's lookahead KV page (and to free it again
+        on reject), keeping the one-page-per-step allocator invariant intact."""
+        from freetoken.env import ENV
+
+        if not (
+            getattr(self.model, "mtp_enabled", False)
+            and os.environ.get("FREETOKEN_GLM_SPEC", "") == "1"
+            # Overlap scheduling drains a step while the next is in flight; the
+            # bonus-token bookkeeping (and the lookahead page's reject-free) need
+            # the synchronous loop. v1 requires FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1.
+            and ENV.DISABLE_OVERLAP_SCHEDULING
+            and batch.is_decode
+            and batch.size == 1
+            and not getattr(batch, "spec_verify", False)
+        ):
+            return False
+        req = batch.reqs[0]
+        pend = getattr(self, "_mtp_pending", {}).get(req.uid)
+        return (
+            pend is not None
+            # >= 3 keeps the budget boundary clean: after a step consuming 2
+            # tokens at least one remains, so the main token can never be
+            # length-finished while a bonus token exists.
+            and req.remain_len >= 3
+            # v1: shared-selection causality needs the dense identity path or
+            # row-sentinel masking within the selection -- both valid while
+            # every live position fits the top-k window.
+            and req.device_len + 2 < getattr(
+                self.config.model_config.glm_dsa_args, "index_topk", 1 << 30
+            )
+        )
+
+    def _spec_prepare_mid_buffers(self) -> None:
+        """Per-linear-layer single-slot buffers the KDA op stashes its MID state
+        into during a verify forward (the state AFTER the committed token t,
+        BEFORE the draft d). A rejected draft restores from these -- restoring
+        to before the whole verify would drop t from the recurrence."""
+        pool = self.linear_state_pool
+        if getattr(pool, "spec_mid_conv", None) is None:
+            pool.spec_mid_conv = [torch.empty_like(cs[0:1]) for cs in pool.conv_states]
+            pool.spec_mid_rec = [torch.empty_like(rs[0:1]) for rs in pool.recurrent_states]
+
+    def _spec_restore(self, slot_idx: torch.Tensor) -> None:
+        """Reject: roll the GDN slot back to the mid-verify state (includes t)."""
+        pool = self.linear_state_pool
+        idx = slot_idx.to(torch.int64)
+        for buf, dst in zip(pool.spec_mid_conv, pool.conv_states):
+            dst.index_copy_(0, idx, buf.to(dst.dtype))
+        for buf, dst in zip(pool.spec_mid_rec, pool.recurrent_states):
+            dst.index_copy_(0, idx, buf.to(dst.dtype))
+
+    def _spec_forward(
+        self, batch: Batch, args: BatchSamplingArgs, draft: int
+    ) -> ForwardOutput:
+        """k=1 speculative decode step (eager verify, bs == 1).
+
+        One decode-phase forward over TWO tokens -- the pending token t and the
+        MTP draft d. Row 0's logits sample s1 (the token after t); s1 == d
+        accepts the draft and row 1's logits sample a BONUS token s2. On reject
+        the KDA conv/recurrent states roll back from the pre-forward snapshot;
+        the paged rows written for d's position are dead until the same slot is
+        rewritten next step (lengths never include them). The MTP maintenance
+        pass then writes the MTP layer's rows for every ACCEPTED position and
+        produces the next draft."""
+        from freetoken.attention.dsa import DSAMetadata
+
+        req = batch.reqs[0]
+        dev = self.device
+        model = self.model
+        self._mtp_pending.pop(req.uid, None)
+        p = int(batch.positions[0].item())
+
+        batch.input_ids = torch.cat(
+            [batch.input_ids, torch.tensor([draft], dtype=batch.input_ids.dtype, device=dev)]
+        )
+        batch.positions = torch.cat([batch.positions, batch.positions + 1])
+        loc2 = self.ctx.page_table[req.table_idx, p + 1].view(1).to(batch.out_loc.dtype)
+        batch.out_loc = torch.cat([batch.out_loc, loc2])
+        batch.spec_verify = True
+
+        from freetoken.attention.linear import FLAMetadata
+
+        slot_idx = batch.linear_table_idx
+        if slot_idx is None:
+            slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+            slot_idx = torch.tensor([slot], dtype=torch.int32, device=dev)
+        batch.fla_metadata = FLAMetadata(
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=dev),
+            cache_indices=slot_idx,
+            has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
+        )
+
+        def _md(n_tokens: int, kv_final: int) -> DSAMetadata:
+            md = DSAMetadata(
+                is_decode=True,
+                last_indices=torch.tensor(
+                    [n_tokens - 1], dtype=torch.int64, device=dev
+                ),
+                qo_indptr_cpu=torch.tensor([0, n_tokens], dtype=torch.int32),
+                kv_len_cpu=torch.tensor([kv_final], dtype=torch.int32),
+            )
+            md.spec_m = n_tokens
+            return md
+
+        batch.attn_metadata = _md(2, p + 2)
+
+        self._spec_prepare_mid_buffers()
+        with self.ctx.forward_batch(batch):
+            logits = model.forward()
+
+        s1 = self.sampler.sample(logits[0:1], args).to(torch.int32)
+        s1_i = int(s1.item())
+        if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
+            n = getattr(self, "_spec_dbg_n", 0)
+            if n < 12:
+                self._spec_dbg_n = n + 1
+                logger.info_rank0(
+                    f"spec dbg: p={p} t={int(batch.input_ids[0].item())} draft={draft} "
+                    f"s1={s1_i} top0={int(logits[0].argmax().item())} "
+                    f"top1={int(logits[1].argmax().item())}"
+                )
+        req.complete_one()
+        eos = getattr(self, "spec_eos_token_ids", ())
+        accepted = s1_i == draft and s1_i not in eos and req.can_decode
+        stats = getattr(self, "_spec_stats", None)
+        if stats is None:
+            stats = self._spec_stats = [0, 0]  # steps, accepted
+        stats[0] += 1
+        if accepted:
+            stats[1] += 1
+            s2 = self.sampler.sample(logits[1:2], args).to(torch.int32)
+            req.complete_one()
+        else:
+            self._spec_restore(slot_idx)
+        if (stats[0] & 255) == 0:
+            logger.info_rank0(
+                f"spec decode: accepted {stats[1]}/{stats[0]} "
+                f"({stats[1] / stats[0]:.1%}), tokens/step {1 + stats[1] / stats[0]:.2f}"
+            )
+
+        # MTP maintenance + next draft (pairs (h_i, token_{i+1}) for accepted rows).
+        hidden = model.last_hidden
+        if accepted:
+            mtp_tokens = torch.cat([s1, s2])
+            with self.ctx.forward_batch(batch):
+                dlog = model.mtp_draft(hidden[:2], mtp_tokens)
+        else:
+            batch.input_ids = batch.input_ids[:1]
+            batch.positions = batch.positions[:1]
+            batch.out_loc = batch.out_loc[:1]
+            batch.attn_metadata = _md(1, p + 1)
+            with self.ctx.forward_batch(batch):
+                dlog = model.mtp_draft(hidden[:1], s1)
+        self._mtp_pending[req.uid] = ("decode", int(dlog[-1].argmax().item()))
+
+        next_cpu = s1.to("cpu", non_blocking=True)
+        extra = None
+        if accepted:
+            extra = (s2, s2.to("cpu", non_blocking=True))
+        ev = torch.cuda.Event()
+        ev.record(self.stream)
+        return ForwardOutput(s1, next_cpu, ev, extra)
 
     def _mtp_observe(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
         """M1 (measurement mode): run the MTP draft layer alongside normal decoding

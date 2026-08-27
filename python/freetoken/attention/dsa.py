@@ -269,14 +269,33 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         return sel, cnt
 
     def _decode(self, md, layer_id, q_nope, q_pe, indexer_qkw) -> torch.Tensor:
-        bs = q_nope.shape[0]
+        # m > 1: speculative VERIFY -- m query tokens per sequence in one decode
+        # forward. kvlen counts ALL m new rows; selection runs once with the LAST
+        # query (the model's own index_share_for_mtp_iteration design) and
+        # causality for earlier queries comes from per-query counts (identity
+        # path: the row list is position-ordered) or from masking the newer
+        # tokens' rows to the -1 sentinel (top-k path: arbitrary row order).
+        m = getattr(md, "spec_m", 1)
+        total = q_nope.shape[0]
+        bs = total // m
         rows, kvlen = md.rows, md.kvlen
         if not self.dsa_enabled:
             # Identity selection == dense attention: every query walks its request's
             # whole row list, bounded by the device-side live length.
-            sel, cnt = rows.view(bs, 1, -1), kvlen.view(bs, 1)
+            sel = rows.view(bs, 1, -1)
+            if m == 1:
+                cnt = kvlen.view(bs, 1)
+            else:
+                back = torch.arange(m - 1, -1, -1, device=kvlen.device, dtype=kvlen.dtype)
+                cnt = (kvlen.view(bs, 1) - back).to(torch.int32)
         else:
             if indexer_qkw is not None:
+                if m > 1:
+                    last = torch.arange(bs, device=q_nope.device) * m + (m - 1)
+                    indexer_qkw = tuple(
+                        t.index_select(0, last) if t is not None and t.dim() > 1 else t
+                        for t in indexer_qkw
+                    )
                 if self.index_kpool > 1:
                     q_idx, _, w, _gate, ape = indexer_qkw
                     sel, cnt = self._decode_select_kpool(md, layer_id, q_idx, w, ape)
@@ -289,13 +308,28 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                     )[:, 0]  # [bs, K] positions, -1 sentinel
                     sel = self.dsa_map_rows(picks, rows).view(bs, 1, -1)
                     cnt = torch.clamp(kvlen, max=k_sel).to(torch.int32).view(bs, 1)
+                if m > 1:
+                    # Per-query causal sel: query j must not see the rows of the
+                    # later verify tokens (positions kvlen-(m-1-j)..kvlen-1).
+                    per_q = [sel[:, 0]]
+                    masked = sel[:, 0]
+                    for r in range(1, m):
+                        newer = rows.gather(
+                            1, (kvlen.to(torch.int64) - r).view(bs, 1)
+                        ).to(masked.dtype)
+                        masked = torch.where(masked == newer, masked.new_full((), -1), masked)
+                        per_q.append(masked)
+                    sel = torch.stack(list(reversed(per_q)), dim=1)  # [bs, m, K]
+                    cnt = torch.full(
+                        (bs, m), sel.shape[-1], dtype=torch.int32, device=sel.device
+                    )
                 # Only the live group leader's selection is ever read again.
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, m, self.num_heads, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
-        return o.view(bs, self.num_heads, self.kv_lora_rank)
+        return o.view(total, self.num_heads, self.kv_lora_rank)
 
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill_kpool(

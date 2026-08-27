@@ -109,6 +109,55 @@ class Glm53KDA(BaseOP):
         b = self.b_proj.forward(hidden_states)  # raw beta [T, HV]
         li = pool.local_index(self.layer_id)
 
+        if getattr(batch, "spec_verify", False):
+            # Speculative verify: the m tokens run as m sequential single-token
+            # decode-kernel calls. After token 0 (the COMMITTED token t) the
+            # state is stashed into the pool's spec-mid buffers: a rejected
+            # draft rolls back to the state INCLUDING t -- restoring to before
+            # the whole verify would drop t from the recurrence (measured as
+            # cumulative text corruption under sampling).
+            from freetoken.kernel.fla.fused_recurrent import (
+                fused_recurrent_kda_packed_decode,
+            )
+
+            m = conv_in.shape[0]
+            slot = fla.cache_indices
+            outs = []
+            for j in range(m):
+                mixed = causal_conv1d_decode(
+                    conv_in[j : j + 1].contiguous(), pool.conv_states[li],
+                    self._conv_weight(), slot,
+                )
+                out_j = mixed.new_empty(1, 1, self.num_heads, self.head_dim)
+                fused_recurrent_kda_packed_decode(
+                    mixed.contiguous(),
+                    a[j : j + 1].float().contiguous(),
+                    b[j : j + 1].float().contiguous(),
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    scale=self.head_dim**-0.5,
+                    initial_state=pool.recurrent_states[li],
+                    out=out_j,
+                    ssm_state_indices=slot,
+                    use_qk_l2norm_in_kernel=True,
+                    lower_bound=self.lower_bound,
+                )
+                if j == 0:
+                    # index_select keeps this host-sync-free (slot is a device tensor)
+                    pool.spec_mid_conv[li].copy_(
+                        pool.conv_states[li].index_select(0, slot)
+                    )
+                    pool.spec_mid_rec[li].copy_(
+                        pool.recurrent_states[li].index_select(0, slot)
+                    )
+                outs.append(out_j.view(1, self.num_heads, self.head_dim))
+            core_out = torch.cat(outs, dim=0)
+            gate = self.g_b_proj.forward(self.g_a_proj.forward(hidden_states))
+            out = self.o_norm.forward(
+                core_out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim)
+            ).reshape(total, self.qkv_dim)
+            return self.o_proj.forward(out)
+
         if batch.is_decode:
             from freetoken.kernel.fla.fused_recurrent import (
                 fused_recurrent_kda_packed_decode,

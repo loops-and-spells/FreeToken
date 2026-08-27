@@ -91,6 +91,29 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """Incremental-decode a batch of per-token messages.
+
+        The offset bookkeeping snapshots read/surr windows for the WHOLE batch
+        before applying any updates, so two messages for the SAME uid in one
+        call (speculative decode emits main + bonus tokens together) would
+        re-emit the first token's text. Split at duplicate uids and process the
+        groups sequentially; the common no-duplicate case stays one batch."""
+        uids = [m.uid for m in msgs]
+        if len(set(uids)) != len(uids):
+            out: List[str] = []
+            start = 0
+            seen: set = set()
+            for i, uid in enumerate(uids):
+                if uid in seen:
+                    out.extend(self._detokenize_group(msgs[start:i]))
+                    start = i
+                    seen = set()
+                seen.add(uid)
+            out.extend(self._detokenize_group(msgs[start:]))
+            return out
+        return self._detokenize_group(msgs)
+
+    def _detokenize_group(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

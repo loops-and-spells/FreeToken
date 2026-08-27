@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
 
 
+import os
+
 logger = init_logger(__name__)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
@@ -114,6 +116,9 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
+        # Speculative decode: the engine must not accept a bonus token past an
+        # EOS (the extra append would outlive the request's terminal reply).
+        self.engine.spec_eos_token_ids = frozenset(self.eos_token_ids)
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (
             self.cache_manager.is_hybrid or self.cache_manager.is_swa
@@ -303,7 +308,12 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, fo = last_data[0].batch, last_data[1]
+        # Positional access: tests stand in plain tuples for ForwardOutput.
+        next_tokens_cpu, copy_done = fo[1], fo[2]
+        spec_extra = fo[3] if len(fo) > 3 else None
+        if spec_extra is not None and os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
+            logger.info(f"spec drain: extra present, phase={getattr(batch, 'phase', '?')}")
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -339,7 +349,15 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                # can_decode is STALE under overlap (the next step's complete_one
+                # already advanced device_len). A spec step's engine guard
+                # (remain_len >= 3 at entry) guarantees neither its main nor its
+                # bonus token can be the length-terminal one, so never length-
+                # finish here on a spec step -- the trailing vanilla steps carry
+                # the length finish.
+                hit_length = not req.can_decode and not (
+                    spec_extra is not None and i == 0
+                )
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 )
@@ -371,6 +389,14 @@ class Scheduler(SchedulerIOMixin):
                     )
                 )
 
+                if not finished and spec_extra is not None and i == 0:
+                    # Accepted speculative bonus token (bs == 1): same per-token
+                    # bookkeeping as the main token, one position later.
+                    finished = self._process_spec_extra(
+                        req, spec_extra[1], reply, new_finished_reqs
+                    )
+                    if finished:
+                        continue  # _process_spec_extra freed the request
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
@@ -416,6 +442,45 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _process_spec_extra(
+        self, req: Req, tok_cpu: torch.Tensor, reply: list, new_finished_reqs: set
+    ) -> bool:
+        """Per-token bookkeeping for an accepted speculative BONUS token (decode
+        path only): append, stop checks, reply, terminal free. Returns finished."""
+        if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
+            logger.info(f"spec bonus: append tok={int(tok_cpu.item())} n={req.input_ids.numel()}")
+        req.append_host(tok_cpu.view(1))
+        t = int(tok_cpu.item())
+        # The engine's remain_len >= 3 entry guard means the bonus token is never
+        # the length-terminal one (and can_decode is stale under overlap anyway).
+        hit_length = False
+        hit_eos = not req.sampling_params.ignore_eos and t in self.eos_token_ids
+        matched_stop = (
+            self._match_stop_str(req)
+            if not hit_eos and req.sampling_params.stop_strs
+            else None
+        )
+        finished = hit_length or hit_eos or matched_stop is not None
+        reply.append(
+            DetokenizeMsg(
+                uid=req.uid,
+                next_token=t,
+                finished=finished,
+                finish_reason=(
+                    ("stop" if (hit_eos or matched_stop is not None) else "length")
+                    if finished
+                    else None
+                ),
+                matched_stop=matched_stop,
+                stop_strs=req.sampling_params.stop_strs or None,
+            )
+        )
+        if finished and req not in self.finished_reqs:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+        return finished
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -601,12 +666,21 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        dbg = os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1"
+        if dbg:
+            before = len(self.cache_manager.free_slots)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+        if dbg:
+            logger.info(
+                f"spec free_req: cached={req.cached_len} device={req.device_len} "
+                f"la={getattr(req, 'spec_lookahead_pos', None)} "
+                f"freed={len(self.cache_manager.free_slots) - before}"
+            )
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is
@@ -868,8 +942,24 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        spec = self.engine.spec_will_verify(batch)
+        if spec:
+            # The verify forward writes KV one position ahead; allocate that page
+            # now and free it on reject so the allocator's one-page-per-step
+            # invariant (and every free/caching path built on it) is preserved.
+            self.cache_manager.allocate_spec_lookahead(batch.reqs[0])
         forward_output = self.engine.forward_batch(batch, sample_args)
+        if spec:
+            if forward_output.spec_extra is None:
+                self.cache_manager.free_spec_lookahead(batch.reqs[0])
+            else:
+                batch.reqs[0].spec_lookahead_pos = None  # became a normal page
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if forward_output.spec_extra is not None:
+            # Accepted speculative bonus token: lands one position after the
+            # main token so the next step's input read finds it (bs == 1).
+            idx, pos = output_mapping
+            self.token_pool[idx, pos + 1] = forward_output.spec_extra[0]
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

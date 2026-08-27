@@ -96,6 +96,15 @@ class HybridRadixCache:
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
         node, prefix_len = self._walk(input_ids)
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
+            from freetoken.utils import init_logger
+
+            init_logger(__name__).info_rank0(
+                f"spec insert: len={insert_len} prefix={prefix_len} "
+                f"evictable={self.full_evictable} uniq={len(set(kv_indices.tolist()))}"
+            )
         if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
