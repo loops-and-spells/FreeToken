@@ -429,6 +429,8 @@ class Engine:
             self._warmup_prefill()
         # After graph capture: the keepalive's periodic kernel on the bank device
         # invalidates an in-progress capture (global capture mode).
+        # Before the keepalive: its periodic kernel invalidates an in-progress capture.
+        self._capture_spec_verify_graph()
         self._start_bank_device_keepalive()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -1186,6 +1188,106 @@ class Engine:
             )
         )
 
+    def _capture_spec_verify_graph(self) -> None:
+        """Capture the (bs=1, m=2) speculative VERIFY forward as a CUDA graph.
+
+        All addressing lives in dedicated static buffers (input ids, positions,
+        out_loc, GDN slot, page-table row snapshot, kv length); the metadata
+        objects are built once pointing at them, so a replay only needs the
+        buffers refreshed. Captured on the decode graphs' memory pool, after
+        prefill warmup and before the bank keepalive starts. Eager verify was
+        ~2.2x a captured decode step and ate most of the 1.76 tokens/step win."""
+        self._spec_graph = None
+        if not (
+            getattr(self.model, "mtp_enabled", False)
+            and os.environ.get("FREETOKEN_GLM_SPEC", "") == "1"
+            and os.environ.get("FREETOKEN_GLM_SPEC_EAGER", "") != "1"
+            and self.graph_runner.graph_map
+        ):
+            return
+        from freetoken.attention.dsa import DSAMetadata
+        from freetoken.attention.linear import FLAMetadata
+
+        dev = self.device
+        model = self.model
+        self._spec_prepare_mid_buffers()
+        table_width = self.ctx.page_table.shape[1]
+        buf = {
+            "input_ids": torch.zeros(2, dtype=torch.int32, device=dev),
+            "positions": torch.zeros(2, dtype=torch.int32, device=dev),
+            "out_loc": torch.zeros(2, dtype=torch.int32, device=dev),
+            "slot": torch.zeros(1, dtype=torch.int32, device=dev),
+            "rows": torch.zeros(1, table_width, dtype=torch.int32, device=dev),
+            "kvlen": torch.zeros(1, dtype=torch.int32, device=dev),
+        }
+        dummy = self.dummy_req
+        buf["rows"].copy_(self.ctx.page_table[dummy.table_idx : dummy.table_idx + 1])
+        buf["out_loc"].copy_(buf["rows"][0, :2])
+        buf["kvlen"].fill_(2)
+        dummy_slot = (
+            dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx
+        )
+        buf["slot"].fill_(dummy_slot)
+
+        batch = Batch(reqs=[dummy], phase="decode")
+        batch.padded_reqs = batch.reqs
+        batch.spec_verify = True
+        batch.input_ids = buf["input_ids"]
+        batch.positions = buf["positions"]
+        batch.out_loc = buf["out_loc"]
+        batch.linear_table_idx = buf["slot"]
+        batch.fla_metadata = FLAMetadata(
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=dev),
+            cache_indices=buf["slot"],
+            has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
+        )
+        md = DSAMetadata(
+            is_decode=True,
+            last_indices=torch.tensor([1], dtype=torch.int64, device=dev),
+            qo_indptr_cpu=torch.tensor([0, 2], dtype=torch.int32),
+            kv_len_cpu=torch.tensor([2], dtype=torch.int32),
+        )
+        md.spec_m = 2
+        md.rows = buf["rows"]
+        md.kvlen = buf["kvlen"]
+        batch.attn_metadata = md
+
+        cfg = self.config.model_config
+        self._spec_logits_buf = torch.empty(
+            2, cfg.vocab_size, dtype=torch.float32, device=dev
+        )
+        self._spec_hidden_buf = torch.empty(
+            2, cfg.hidden_size, dtype=self.dtype, device=dev
+        )
+        pool = next(iter(self.graph_runner.graph_map.values())).pool()
+        with self.ctx.forward_batch(batch):
+            out = model.forward()  # eager warmup: m=2 triton specializations
+            self._spec_logits_buf.copy_(out[:2])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                out = model.forward()
+                self._spec_logits_buf.copy_(out[:2])
+                self._spec_hidden_buf.copy_(model.last_hidden[:2])
+        self.graph_runner._reset_moe_offload_cache()
+        self._spec_batch = batch
+        self._spec_buf = buf
+        self._spec_graph = graph
+        # Second graph: the ACCEPTED-case MTP maintenance + next-draft pass
+        # (~78% of steps). Inputs are the verify graph's hidden export and a
+        # static token pair; the output worth exporting is just the argmax.
+        self._spec_mtp_tokens = torch.zeros(2, dtype=torch.int32, device=dev)
+        self._spec_draft_buf = torch.zeros(1, dtype=torch.int64, device=dev)
+        with self.ctx.forward_batch(batch):
+            dlog = model.mtp_draft(self._spec_hidden_buf, self._spec_mtp_tokens)
+            self._spec_draft_buf.copy_(dlog[-1:].argmax(dim=-1))
+            mtp_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(mtp_graph, pool=pool, stream=self.stream):
+                dlog = model.mtp_draft(self._spec_hidden_buf, self._spec_mtp_tokens)
+                self._spec_draft_buf.copy_(dlog[-1:].argmax(dim=-1))
+        self.graph_runner._reset_moe_offload_cache()
+        self._spec_mtp_graph = mtp_graph
+        logger.info_rank0("spec verify + mtp CUDA graphs captured (bs=1, m=2)")
+
     def _spec_prepare_mid_buffers(self) -> None:
         """Per-linear-layer single-slot buffers the KDA op stashes its MID state
         into during a verify forward (the state AFTER the committed token t,
@@ -1226,25 +1328,10 @@ class Engine:
         self._mtp_pending.pop(req.uid, None)
         p = int(batch.positions[0].item())
 
-        batch.input_ids = torch.cat(
-            [batch.input_ids, torch.tensor([draft], dtype=batch.input_ids.dtype, device=dev)]
-        )
-        batch.positions = torch.cat([batch.positions, batch.positions + 1])
-        loc2 = self.ctx.page_table[req.table_idx, p + 1].view(1).to(batch.out_loc.dtype)
-        batch.out_loc = torch.cat([batch.out_loc, loc2])
-        batch.spec_verify = True
-
-        from freetoken.attention.linear import FLAMetadata
-
         slot_idx = batch.linear_table_idx
         if slot_idx is None:
             slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
             slot_idx = torch.tensor([slot], dtype=torch.int32, device=dev)
-        batch.fla_metadata = FLAMetadata(
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=dev),
-            cache_indices=slot_idx,
-            has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
-        )
 
         def _md(n_tokens: int, kv_final: int) -> DSAMetadata:
             md = DSAMetadata(
@@ -1258,11 +1345,48 @@ class Engine:
             md.spec_m = n_tokens
             return md
 
-        batch.attn_metadata = _md(2, p + 2)
-
         self._spec_prepare_mid_buffers()
-        with self.ctx.forward_batch(batch):
-            logits = model.forward()
+        use_graph = getattr(self, "_spec_graph", None) is not None
+        if use_graph:
+            # Replay path: refresh the static addressing buffers, replay the
+            # captured (bs=1, m=2) verify graph, read the exported logits/hidden.
+            vb, buf = self._spec_batch, self._spec_buf
+            buf["input_ids"][:1].copy_(batch.input_ids)
+            buf["input_ids"][1:].fill_(draft)
+            buf["positions"][:1].copy_(batch.positions)
+            buf["positions"][1:].copy_(batch.positions + 1)
+            buf["out_loc"][:1].copy_(batch.out_loc)
+            buf["out_loc"][1:].copy_(self.ctx.page_table[req.table_idx, p + 1].view(1))
+            buf["slot"].copy_(slot_idx)
+            buf["rows"].copy_(self.ctx.page_table[req.table_idx : req.table_idx + 1])
+            buf["kvlen"].fill_(p + 2)
+            self._spec_graph.replay()
+            logits = self._spec_logits_buf
+            hidden = self._spec_hidden_buf
+            mtp_batch = vb
+        else:
+            from freetoken.attention.linear import FLAMetadata
+
+            batch.input_ids = torch.cat(
+                [
+                    batch.input_ids,
+                    torch.tensor([draft], dtype=batch.input_ids.dtype, device=dev),
+                ]
+            )
+            batch.positions = torch.cat([batch.positions, batch.positions + 1])
+            loc2 = self.ctx.page_table[req.table_idx, p + 1].view(1).to(batch.out_loc.dtype)
+            batch.out_loc = torch.cat([batch.out_loc, loc2])
+            batch.spec_verify = True
+            batch.fla_metadata = FLAMetadata(
+                cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=dev),
+                cache_indices=slot_idx,
+                has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
+            )
+            batch.attn_metadata = _md(2, p + 2)
+            with self.ctx.forward_batch(batch):
+                logits = model.forward()
+            hidden = model.last_hidden
+            mtp_batch = batch
 
         s1 = self.sampler.sample(logits[0:1], args).to(torch.int32)
         s1_i = int(s1.item())
@@ -1295,11 +1419,30 @@ class Engine:
             )
 
         # MTP maintenance + next draft (pairs (h_i, token_{i+1}) for accepted rows).
-        hidden = model.last_hidden
+        if accepted and use_graph:
+            self._spec_mtp_tokens[:1].copy_(s1)
+            self._spec_mtp_tokens[1:].copy_(s2)
+            self._spec_mtp_graph.replay()
+            self._mtp_pending[req.uid] = ("decode", int(self._spec_draft_buf.item()))
+            next_cpu = s1.to("cpu", non_blocking=True)
+            extra = (s2, s2.to("cpu", non_blocking=True))
+            ev = torch.cuda.Event()
+            ev.record(self.stream)
+            return ForwardOutput(s1, next_cpu, ev, extra)
         if accepted:
             mtp_tokens = torch.cat([s1, s2])
-            with self.ctx.forward_batch(batch):
+            with self.ctx.forward_batch(mtp_batch):
                 dlog = model.mtp_draft(hidden[:2], mtp_tokens)
+        elif use_graph:
+            saved = (mtp_batch.out_loc, mtp_batch.attn_metadata)
+            mtp_batch.out_loc = self._spec_buf["out_loc"][:1]
+            md1 = _md(1, p + 1)
+            md1.rows = self._spec_buf["rows"]
+            md1.kvlen = torch.tensor([p + 1], dtype=torch.int32, device=dev)
+            mtp_batch.attn_metadata = md1
+            with self.ctx.forward_batch(mtp_batch):
+                dlog = model.mtp_draft(hidden[:1], s1)
+            mtp_batch.out_loc, mtp_batch.attn_metadata = saved
         else:
             batch.input_ids = batch.input_ids[:1]
             batch.positions = batch.positions[:1]
