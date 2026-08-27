@@ -37,6 +37,12 @@ from freetoken.models.loader import iter_weight_files
 # The qwen3_5_moe block-fp8 expert-bank builder matches this checkpoint exactly:
 # same ``model.language_model.layers.N.mlp.experts.E.{gate,up,down}_proj`` keys,
 # same 128x128 ``weight_scale_inv`` layout, dims read off the shared ModelConfig.
+from freetoken.models.nvfp4_banks import (
+    Nvfp4ExpertSourceSpec,
+    load_nvfp4_expert_source_banks,
+    load_nvfp4_expert_source_banks_parallel,
+)
+from freetoken.models.loader import drop_page_cache
 from freetoken.models.qwen3_5_moe.weight import (  # noqa: F401
     setup_offload_expert_banks,
 )
@@ -119,8 +125,9 @@ def iter_weights(
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
-        "GLM-5.3-Flash routed experts are block-fp8 and only support the offload "
-        "backend; they are loaded into the offload cache via setup_offload_expert_banks."
+        "GLM-5.3-Flash routed experts are quantized (block-fp8 or NVFP4) and only "
+        "support the offload backend; they are loaded into the offload cache via "
+        "setup_offload_expert_banks."
     )
     assert include_non_moe
     config = parse_config(cached_load_hf_config(model_path))
@@ -155,4 +162,50 @@ def iter_weights(
     assert not fuse_buf, f"Incomplete KDA fusions: {list(fuse_buf.keys())}"
 
 
-__all__ = ["iter_weights", "setup_offload_expert_banks"]
+# ======================================================================================
+# NVFP4 routed experts (modelopt community quants, e.g. LibertAIDAI/GLM-5.3-Flash-NVFP4)
+# ======================================================================================
+# Experts-only quant: per-expert un-fused ``weight`` (packed uint8) + ``weight_scale``
+# (fp8 block) + ``weight_scale_2`` (global), under the SAME key layout as the FP8
+# checkpoint. Dense tensors are plain bf16 and ride iter_weights unchanged. The bank
+# index is the MoE layer (global layer minus the dense prefix), matching how
+# make_moe_layer addresses the offload cache.
+_NVFP4_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+)
+_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_NVFP4_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer - config.first_k_dense_replace,
+    desc="GLM-5.3 NVFP4 experts",
+)
+
+
+def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None):
+    return load_nvfp4_expert_source_banks(
+        model_path, config, _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        layer_sink=layer_sink,
+    )
+
+
+def load_nvfp4_expert_sources_parallel(
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
+):
+    return load_nvfp4_expert_source_banks_parallel(
+        model_path, config, _NVFP4_SOURCE_SPEC,
+        drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        workers=workers, chunk=chunk,
+        layer_sink=layer_sink,
+    )
+
+
+__all__ = [
+    "iter_weights",
+    "setup_offload_expert_banks",
+    "load_nvfp4_expert_sources",
+    "load_nvfp4_expert_sources_parallel",
+]

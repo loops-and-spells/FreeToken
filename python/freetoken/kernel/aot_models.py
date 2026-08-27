@@ -262,7 +262,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=(),
         top_k=8,
         moe_intermediate_size=2048,
-        expert_formats=("fp8_block",),
+        expert_formats=("fp8_block", "nvfp4", "nvfp4_marlin", "nvfp4_b12x"),
     ),
     AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank

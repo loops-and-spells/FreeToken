@@ -479,3 +479,43 @@ def _kpool_ref_attend(q_cat, pool_rows, live_rows, scale, dv):
     k = pool_rows[live_rows.long()].float()
     s = (q_cat.float() @ k.T) * scale
     return s.softmax(-1) @ k[:, :dv]
+
+
+# ---------------------------------------------------------------------------------
+# NVFP4 community-quant surface (experts-only quant; dense stays bf16)
+# ---------------------------------------------------------------------------------
+
+
+def test_parse_config_nvfp4_expert_quant():
+    from freetoken.models.glm_5_3.config import parse_config
+
+    class _NVFP4HF(_HFNS):
+        quantization_config = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "config_groups": {"group_0": {"targets": ["Linear"]}},
+        }
+
+    cfg = parse_config(_NVFP4HF())
+    assert cfg.expert_quant == "nvfp4"
+    assert cfg.weight_block_size is None
+
+
+def test_nvfp4_source_spec_matches_checkpoint_keys():
+    from freetoken.models.glm_5_3.weight import _NVFP4_EXPERT_KEY_RE, _NVFP4_SOURCE_SPEC
+
+    m = _NVFP4_EXPERT_KEY_RE.match(
+        "model.language_model.layers.3.mlp.experts.287.down_proj.weight_scale_2"
+    )
+    assert m and m["layer"] == "3" and m["expert"] == "287" and m["kind"] == "weight_scale_2"
+    # MTP and vision keys never match
+    assert _NVFP4_EXPERT_KEY_RE.match("mtp.layers.45.mlp.experts.0.gate_proj.weight") is None
+    assert _NVFP4_EXPERT_KEY_RE.match(
+        "model.visual.blocks.0.mlp.experts.0.gate_proj.weight"
+    ) is None
+    # bank index is the MoE layer (global minus the dense prefix)
+    class _C:
+        first_k_dense_replace = 3
+
+    assert _NVFP4_SOURCE_SPEC.layer_to_bank(3, _C) == 0
+    assert _NVFP4_SOURCE_SPEC.layer_to_bank(44, _C) == 41

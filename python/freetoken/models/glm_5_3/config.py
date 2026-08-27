@@ -11,10 +11,14 @@ backend capability gate all read the same specs):
 * ``linear`` -- the 34 KDA layers, on the standard ``LinearGatedDeltaGroupConfig``
   (KDA's conv + [K, V] recurrent state has exactly the GDN pool geometry).
 
-The FP8 checkpoint is DeepSeek-style 128x128 block-fp8 over the sparse-attention
-projections, dense/shared MLPs and the routed experts (KDA projections, ``kv_b``,
-the indexer and every mHC/norm/embedding tensor stay bf16); ``expert_quant`` is
-``fp8_block`` and the dense projections ride the shared ``Fp8BlockLinear`` path.
+The native FP8 checkpoint is DeepSeek-style 128x128 block-fp8 over the
+sparse-attention projections, dense/shared MLPs and the routed experts (KDA
+projections, ``kv_b``, the indexer and every mHC/norm/embedding tensor stay
+bf16); ``expert_quant`` is ``fp8_block`` and the dense projections ride the
+shared ``Fp8BlockLinear`` path. The modelopt NVFP4 community quants
+(LibertAIDAI/GLM-5.3-Flash-NVFP4) quantize ONLY the routed experts -- dense
+stays bf16 and ``expert_quant`` is ``nvfp4`` (the generic NVFP4 offload-bank
+provider via this package's ``load_nvfp4_expert_sources``).
 Serving is text-only (the vision tower is dropped), matching the repo contract.
 """
 
@@ -28,6 +32,7 @@ from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    detect_expert_quant,
 )
 
 from .args import load_args
@@ -113,6 +118,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
     expert_quant, weight_block_size = _fp8_block(hf_config)
+    if expert_quant == "none":
+        # modelopt NVFP4 (LibertAIDAI et al): experts-only quant -- every dense
+        # tensor is plain bf16, so only the routed-expert path changes.
+        expert_quant = detect_expert_quant(hf_config)
 
     return ModelConfig(
         num_layers=num_layers,

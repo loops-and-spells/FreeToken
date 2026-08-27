@@ -191,14 +191,10 @@ def load_nvfp4_expert_source_banks(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
-        "gate_up_packed": gate_up_packed,
-        "gate_up_scale": gate_up_scale,
-        "gate_up_global": gate_up_global,
-        "down_packed": down_packed,
-        "down_scale": down_scale,
-        "down_global": down_global,
-    }
+    # Re-read .tensor at return: a settle-time device migration (host_banks
+    # DEVICE_LABEL_PREFIX) replaces a bank's tensor; the locals above are the
+    # fill-time HOST views and would leak dropped pages into the sources.
+    return {name: [b.tensor for b in _hb[name]] for name in _hb}
 
 
 def load_nvfp4_expert_source_banks_parallel(
@@ -310,14 +306,10 @@ def load_nvfp4_expert_source_banks_parallel(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
-        "gate_up_packed": gate_up_packed,
-        "gate_up_scale": gate_up_scale,
-        "gate_up_global": gate_up_global,
-        "down_packed": down_packed,
-        "down_scale": down_scale,
-        "down_global": down_global,
-    }
+    # Re-read .tensor at return: a settle-time device migration (host_banks
+    # DEVICE_LABEL_PREFIX) replaces a bank's tensor; the locals above are the
+    # fill-time HOST views and would leak dropped pages into the sources.
+    return {name: [b.tensor for b in _hb[name]] for name in _hb}
 
 
 __all__ = [

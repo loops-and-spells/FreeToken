@@ -495,6 +495,66 @@ class Engine:
             quant_format=banks.quant_format,
         )
 
+    def _overlay_device_bank_layers(self, config, requested_residency, cpu_layer_ids):
+        """Apply FREETOKEN_DEVICE_BANK_LAYERS ("<device>=<count>", e.g. "cuda:0=18")
+        onto the residency plan: the trailing <count> non-CPU MoE layers settle as
+        device-resident banks on <device>. Enables peer access from the serving
+        device (the copy kernels dereference peer pointers) and disables MoE
+        prefill overlap (its double buffers assume pinned-host sources). Forces
+        the native "triton" NVFP4 layout: the marlin/b12x repackers rewrite the
+        source banks in place on the host."""
+        spec = os.environ.get("FREETOKEN_DEVICE_BANK_LAYERS", "").strip()
+        if not spec:
+            return requested_residency
+        dev_str, _, count_str = spec.rpartition("=")
+        count = int(count_str)
+        if count <= 0:
+            return requested_residency
+        device = torch.device(dev_str)
+        assert device.type == "cuda" and device.index is not None, spec
+        assert device.index != self.device.index, (
+            "device banks must live on a DIFFERENT card than the serving device"
+        )
+        if not torch.cuda.can_device_access_peer(self.device.index, device.index):
+            raise RuntimeError(
+                f"FREETOKEN_DEVICE_BANK_LAYERS: no P2P access from {self.device} "
+                f"to {device}; the copy kernels cannot read peer banks"
+            )
+        _enable_peer_access(self.device, device.index)
+
+        from freetoken.moe.host_banks import DEVICE_LABEL_PREFIX, HostResidency
+
+        num = config.model_config.num_moe_layers
+        labels = list(requested_residency) if requested_residency is not None else [
+            HostResidency.PINNED.value
+        ] * num
+        label = f"{DEVICE_LABEL_PREFIX}{dev_str}"
+        placed = 0
+        for i in range(num - 1, -1, -1):
+            if placed >= count:
+                break
+            if i in cpu_layer_ids:
+                continue
+            labels[i] = label
+            placed += 1
+        if config.moe_prefill_overlap:
+            logger.info_rank0(
+                "FREETOKEN_DEVICE_BANK_LAYERS: disabling MoE prefill overlap "
+                "(its double buffers assume pinned-host sources)"
+            )
+            object.__setattr__(config, "moe_prefill_overlap", False)
+        if getattr(config.model_config, "nvfp4_backend", "triton") != "triton":
+            logger.info_rank0(
+                "FREETOKEN_DEVICE_BANK_LAYERS: forcing --nvfp4-backend triton "
+                "(marlin/b12x repack source banks in place on the host)"
+            )
+            object.__setattr__(config.model_config, "nvfp4_backend", "triton")
+        logger.info_rank0(
+            f"device banks: {placed} trailing MoE layers' banks settle on {dev_str}; "
+            f"the remaining {num - placed} stay in host RAM"
+        )
+        return labels
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
@@ -572,6 +632,16 @@ class Engine:
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
+            # DEVICE-RESIDENT BANKS (FREETOKEN_DEVICE_BANK_LAYERS="cuda:0=18"):
+            # place the trailing N GPU-path MoE layers' banks on a SECOND CUDA
+            # device instead of host RAM -- capacity for models whose expert set
+            # exceeds RAM, on machines with an idle card. The banks are read by
+            # the same copy kernels over PCIe P2P (measured at pinned-host
+            # bandwidth on P2P-capable cards); host pages are dropped at settle,
+            # so load-time RAM peaks at the PINNED subset only.
+            requested_residency = self._overlay_device_bank_layers(
+                config, requested_residency, cpu_layer_ids
+            )
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
@@ -1115,6 +1185,32 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+
+def _enable_peer_access(serving_device: torch.device, peer_index: int) -> None:
+    """cudaDeviceEnablePeerAccess(peer) in the serving device's (torch's) context.
+
+    A cross-device torch copy does NOT map peer memory (it goes through
+    cudaMemcpyPeer), but the offload copy kernels dereference peer bank pointers
+    directly, so the mapping must exist. Uses the versioned cudart torch itself
+    loaded; rc 704 = already enabled."""
+    import ctypes
+
+    lib = None
+    for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        raise RuntimeError("could not load libcudart for cudaDeviceEnablePeerAccess")
+    with torch.cuda.device(serving_device):
+        torch.zeros(1, device=serving_device)  # ensure the context exists
+        rc = lib.cudaDeviceEnablePeerAccess(peer_index, 0)
+    if rc not in (0, 704):
+        raise RuntimeError(f"cudaDeviceEnablePeerAccess({peer_index}) -> {rc}")
 
 
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:

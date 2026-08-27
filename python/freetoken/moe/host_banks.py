@@ -48,6 +48,14 @@ class HostResidency(str, Enum):
     PAGEABLE = "pageable"
 
 
+# Residency label prefix for DEVICE-RESIDENT banks ("device:cuda:0"): the filled
+# layer is copied to that CUDA device at settle time and its host pages dropped.
+# A device bank has a device address, so it stays on the GPU offload path (the
+# copy kernels read it over PCIe P2P at pinned-host speeds); it is NOT one of the
+# HostResidency classes above -- those are host-memory placements.
+DEVICE_LABEL_PREFIX = "device:"
+
+
 _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
@@ -122,6 +130,19 @@ class HostBank:
 
     def memoryview(self) -> memoryview:
         return memoryview(self._buf)
+
+    def migrate(self, device: str) -> None:
+        """Copy the filled bank to ``device`` and drop the host pages.
+
+        The device tensor replaces ``self.tensor`` (loaders re-read ``.tensor``
+        after settle); the anonymous mmap stays MAPPED (views captured during the
+        fill may still exist) but ``MADV_DONTNEED`` returns its physical pages,
+        so a migrated layer costs address space, not RAM. Only meaningful for the
+        mmap backing before pin/lock."""
+        assert not self._pinned and not self._locked, "migrate() must run before pin/lock"
+        self.tensor = self.tensor.to(torch.device(device), non_blocking=False)
+        if isinstance(self._buf, mmap.mmap):
+            self._buf.madvise(mmap.MADV_DONTNEED)
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
@@ -261,6 +282,8 @@ def _settle(bank: HostBank, residency: str) -> None:
         bank.pin()
     elif residency == HostResidency.LOCKED.value:
         bank.lock()
+    elif residency.startswith(DEVICE_LABEL_PREFIX):
+        bank.migrate(residency[len(DEVICE_LABEL_PREFIX):])
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:

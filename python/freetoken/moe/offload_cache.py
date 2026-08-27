@@ -301,8 +301,12 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
+        # DEVICE-resident banks (host_banks DEVICE_LABEL_PREFIX) have a device
+        # address and ride the normal GPU copy path; only the address-less host
+        # classes (LOCKED/PAGEABLE) must fall back to the CPU executor.
         unpinned = frozenset(
-            i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
+            i for i, r in enumerate(residency)
+            if r in (HostResidency.LOCKED.value, HostResidency.PAGEABLE.value)
         )
         if unpinned:
             if not unpinned <= self.cpu_layer_ids:
