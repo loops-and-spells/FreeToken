@@ -178,6 +178,11 @@ def create_kvcache_pool(
         from .dsa_pool import DSAKVCache, MLAKVCache
 
         spec = kv_specs[0]
+        # Hybrid linear + latent-KV models (GLM-5.3-Flash: KDA + sparse MLA) back only
+        # the MLA layers; ``layer_ids`` remaps global layer ids to dense slabs exactly
+        # like the MHA pool below. ``layer_ids`` was computed above when the model has
+        # linear attention; a pure-MLA model passes None (all layers backed).
+        mla_layer_ids = layer_ids if model_config.has_linear_attention else None
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
             return DSAKVCache(
                 latent_dim=spec.head_dim,
@@ -188,6 +193,7 @@ def create_kvcache_pool(
                 device=device,
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
+                layer_ids=mla_layer_ids,
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,
@@ -196,6 +202,7 @@ def create_kvcache_pool(
             page_size=page_size,
             dtype=dtype,
             device=device,
+            layer_ids=mla_layer_ids,
         )
 
     return MHAKVCache(

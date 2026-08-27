@@ -17,16 +17,25 @@ bytes off the attention-group spec) stay correct by construction.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 
 from .base import BaseKVCachePool
 
 
 class MLAKVCache(BaseKVCachePool):
-    """Paged latent-KV pool: ``[1, num_layers, num_pages, page_size, 1, latent_dim]``.
+    """Paged latent-KV pool: ``[1, num_storage_layers, num_pages, page_size, 1, latent_dim]``.
 
     The leading singleton keeps the buffer shape-compatible with MHAKVCache's
     (tokens = shape[2] * shape[3]).
+
+    ``layer_ids`` lets the pool back only a *subset* of the model's layers while
+    callers keep indexing by their global ``layer_id`` (same contract as
+    MHAKVCache). Hybrid models (e.g. GLM-5.3-Flash's KDA/sparse-MLA stack)
+    interleave linear-attention layers that hold no latent KV; passing the
+    MLA-layer ids here allocates one latent slab per MLA layer instead of per
+    model layer.
     """
 
     def __init__(
@@ -37,18 +46,38 @@ class MLAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        layer_ids: Sequence[int] | None = None,
     ) -> None:
         self._latent_dim = latent_dim
         self._num_layers = num_layers
+        if layer_ids is None:
+            self._num_storage_layers = num_layers
+            self._layer_map: list[int] | None = None
+        else:
+            self._num_storage_layers = len(layer_ids)
+            layer_map = [-1] * num_layers
+            for dense, global_id in enumerate(layer_ids):
+                if global_id < 0 or global_id >= num_layers:
+                    raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
+                layer_map[global_id] = dense
+            self._layer_map = layer_map
         self._page_size = page_size
         self._dtype = dtype
         self._device = device
         self._alloc(num_pages)
 
+    def _storage_slot(self, layer_id: int) -> int:
+        if self._layer_map is None:
+            return layer_id
+        slot = self._layer_map[layer_id]
+        if slot < 0:
+            raise KeyError(f"layer {layer_id} holds no latent KV in this pool")
+        return slot
+
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
         self._kv_buffer = torch.empty(
-            (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim),
+            (1, self._num_storage_layers, num_pages, self._page_size, 1, self._latent_dim),
             device=self._device,
             dtype=self._dtype,
         )
@@ -56,7 +85,8 @@ class MLAKVCache(BaseKVCachePool):
     # -- views ------------------------------------------------------------------
     def k_cache(self, layer_id: int) -> torch.Tensor:
         """Paged latent view ``[num_pages, page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(self._num_pages, self._page_size, -1)
+        slot = self._storage_slot(layer_id)
+        return self._kv_buffer[0, slot].view(self._num_pages, self._page_size, -1)
 
     def v_cache(self, layer_id: int) -> torch.Tensor:
         # MLA: K == V (single latent); same buffer, dsv4_paged_pool precedent.
@@ -64,7 +94,8 @@ class MLAKVCache(BaseKVCachePool):
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, layer_id].view(-1, self._latent_dim)
+        slot = self._storage_slot(layer_id)
+        return self._kv_buffer[0, slot].view(-1, self._latent_dim)
 
     # -- writes -----------------------------------------------------------------
     def store_kv(
@@ -141,10 +172,11 @@ class DSAKVCache(MLAKVCache):
         device: torch.device,
         index_head_dim: int,
         num_index_layers: int,
+        layer_ids: Sequence[int] | None = None,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
-        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device)
+        super().__init__(latent_dim, num_layers, num_pages, page_size, dtype, device, layer_ids)
 
     def _alloc(self, num_pages: int) -> None:
         # Both slabs in one allocation step: rebuild can never leave the pool with a
