@@ -53,10 +53,10 @@ layer is not loaded (no speculative decoding in v1).
 * **Full 45-layer serving** (LibertAIDAI/GLM-5.3-Flash-NVFP4, 181 GiB): on a
   single 96 GB serving GPU + a second card holding 22 MoE layers' expert banks
   device-resident (the new multi-device bank placement) + ~76 GiB pinned host
-  RAM. Coherent thinking-mode answers, ~3–6 tok/s eager decode (CUDA graphs
-  pending validation with device banks). This checkpoint stores per-expert
-  NVFP4 with a separate expert set on the trailing MTP layer, which the source
-  spec maps to None (skipped).
+  RAM. Coherent thinking-mode answers, **~29 tok/s decode** (CUDA graphs,
+  ~24% decode expert-cache miss rate), steady across requests. This checkpoint
+  stores per-expert NVFP4 with a separate expert set on the trailing MTP layer,
+  which the source spec maps to None (skipped).
 * Full suite: no regressions (the one failing test on my machine,
   `test_muse_glimmer_parsers.py::test_mixed_quant_groups_rejected_in_any_order`,
   fails identically on unmodified main — env issue).
@@ -79,7 +79,18 @@ welcome from anyone with the RAM.
   via GPU coredump; memcpys still work, so warmup passes and the first real
   request dies); (2) CPython's anonymous mmap is MAP_SHARED, so freeing a
   migrated layer's host pages needs `MADV_REMOVE`, not `MADV_DONTNEED`
-  (measured: DONTNEED returns 0 of 4 GiB, REMOVE returns all of it).
+  (measured: DONTNEED returns 0 of 4 GiB, REMOVE returns all of it); (3) P2P
+  reads do NOT count as activity on the target card's clock governor -- an
+  otherwise idle bank device sags to P8 with its memory clock at ~3% speed and
+  decode collapses ~3.7x (measured 8 vs 29 tok/s). The engine holds bank
+  devices awake with a tiny periodic kernel (`FREETOKEN_BANK_KEEPALIVE=0` opts
+  out when clocks are locked via `nvidia-smi -lmc`).
+* **Per-layer hybrid decode with device banks**: `--moe-backend hybrid` now
+  composes with device banks -- host-resident layers use the hybrid PCIe+CPU
+  co-compute, device-bank layers (no host copy) keep the plain GPU offload
+  path. Opt-in; on my machine pure offload measured faster (the benched
+  CPU-bandwidth ratio was optimistic under real serving), so nothing changes
+  by default.
 * `/health`-poll-friendly ops flags worth knowing: `--expert-load serial` is
   required when device banks are active (the parallel reader fills layers out
   of order and defeats the migrate-and-drop RAM pacing), and
