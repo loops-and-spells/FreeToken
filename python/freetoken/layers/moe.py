@@ -307,7 +307,9 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.decode_target == "hybrid":
+        # Device-bank layers have no host copy for the hybrid CPU executor to read;
+        # they stay on the plain GPU offload path (per-layer hybrid).
+        if cache.decode_target == "hybrid" and self.layer_id not in cache.device_bank_layer_ids:
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()

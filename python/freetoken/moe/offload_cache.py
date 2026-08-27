@@ -199,6 +199,10 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
+        # DEVICE-resident bank layers: no host copy, so the hybrid path (whose CPU
+        # executor reads host banks) must skip them -- they decode on the plain GPU
+        # offload path. Derived in set_bank_sources.
+        self.device_bank_layer_ids: frozenset = frozenset()
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -322,6 +326,11 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        from freetoken.moe.host_banks import DEVICE_LABEL_PREFIX
+
+        self.device_bank_layer_ids = frozenset(
+            i for i, r in enumerate(residency) if str(r).startswith(DEVICE_LABEL_PREFIX)
+        )
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
