@@ -584,7 +584,19 @@ class Engine:
             and _pin_budget_bytes() is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
-        if config.moe_backend == "hybrid":
+        if config.moe_backend == "hybrid" and os.environ.get("FREETOKEN_DEVICE_BANK_LAYERS", "").strip():
+            # The cpu/hybrid executors read expert banks from HOST memory; device-
+            # resident bank layers have no host copy, so hybrid would re-load them
+            # host-side too -- double residency that exhausts RAM (measured).
+            # Per-layer hybrid (host layers only) is the follow-up; until then,
+            # device banks force the plain GPU offload path.
+            logger.info_rank0(
+                "FREETOKEN_DEVICE_BANK_LAYERS active: forcing --moe-backend offload "
+                "(hybrid's CPU executor needs host-resident banks)"
+            )
+            object.__setattr__(config, "moe_backend", "offload")
+            decode_target = "gpu"
+        elif config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
