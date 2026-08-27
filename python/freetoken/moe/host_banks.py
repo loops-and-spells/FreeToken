@@ -142,7 +142,14 @@ class HostBank:
         assert not self._pinned and not self._locked, "migrate() must run before pin/lock"
         self.tensor = self.tensor.to(torch.device(device), non_blocking=False)
         if isinstance(self._buf, mmap.mmap):
-            self._buf.madvise(mmap.MADV_DONTNEED)
+            # CPython's anonymous mmap is MAP_SHARED (shmem-backed): DONTNEED only
+            # drops PTEs there and frees NOTHING (measured: 0 of 4 GiB back).
+            # MADV_REMOVE punches the shmem pages and returns them to the OS
+            # (measured: all 4 GiB back). DONTNEED stays as a best-effort fallback.
+            try:
+                self._buf.madvise(mmap.MADV_REMOVE)
+            except (OSError, ValueError):
+                self._buf.madvise(mmap.MADV_DONTNEED)
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
@@ -276,6 +283,17 @@ def requested_residency(labels: list[str] | None):
         _requested_residency = prev
 
 
+def _mem_available_gib() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    return int(line.split()[1]) / 1048576
+    except OSError:
+        pass
+    return -1.0
+
+
 def _settle(bank: HostBank, residency: str) -> None:
     """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap)."""
     if residency == HostResidency.PINNED.value:
@@ -284,6 +302,10 @@ def _settle(bank: HostBank, residency: str) -> None:
         bank.lock()
     elif residency.startswith(DEVICE_LABEL_PREFIX):
         bank.migrate(residency[len(DEVICE_LABEL_PREFIX):])
+        logger.info(
+            f"bank settle: migrated {bank.nbytes / 2**30:.2f} GiB to "
+            f"{residency[len(DEVICE_LABEL_PREFIX):]} (MemAvailable {_mem_available_gib():.1f} GiB)"
+        )
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
