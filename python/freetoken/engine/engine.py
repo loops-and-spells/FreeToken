@@ -423,6 +423,9 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        # After graph capture: the keepalive's periodic kernel on the bank device
+        # invalidates an in-progress capture (global capture mode).
+        self._start_bank_device_keepalive()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -558,6 +561,61 @@ class Engine:
         )
         return labels
 
+    def _start_bank_device_keepalive(self) -> None:
+        """Hold the bank devices' clock governors awake.
+
+        P2P reads do not count as activity on the TARGET card: an otherwise idle
+        bank device drops to P8 with its memory clock at ~3% speed (405 vs
+        13365 MHz measured on Blackwell) and every peer expert fetch crawls --
+        8 tok/s decode against 29 tok/s with the clocks held. A tiny kernel
+        launched on the bank device every few ms keeps it at P1 for <1%
+        utilization. Opt out with FREETOKEN_BANK_KEEPALIVE=0 (e.g. when clocks
+        are already locked via nvidia-smi -lmc).
+        """
+        layer_residency = getattr(self, "_bank_keepalive_residency", None)
+        if layer_residency is None:
+            return
+        if os.environ.get("FREETOKEN_BANK_KEEPALIVE", "1") == "0":
+            return
+        from freetoken.moe.host_banks import DEVICE_LABEL_PREFIX
+
+        devices = sorted(
+            {
+                str(r)[len(DEVICE_LABEL_PREFIX):]
+                for r in layer_residency or ()
+                if str(r).startswith(DEVICE_LABEL_PREFIX)
+            }
+        )
+        # The serving device is always active; only idle peer cards sag to P8.
+        devices = [d for d in devices if torch.device(d).index != self.device.index]
+        if not devices:
+            return
+
+        import threading
+
+        # Set while CUDA graphs are (re)captured: a concurrent kernel launch
+        # invalidates an in-progress global-mode capture.
+        self._bank_keepalive_paused = threading.Event()
+
+        def _loop() -> None:
+            import time
+
+            mats = {d: torch.ones(256, 256, device=d) for d in devices}
+            while True:
+                try:
+                    if not self._bank_keepalive_paused.is_set():
+                        for a in mats.values():
+                            (a @ a).sum().item()
+                except Exception as exc:
+                    logger.warning_rank0(f"bank keepalive thread died: {exc!r}")
+                    return
+                time.sleep(0.004)
+
+        threading.Thread(target=_loop, daemon=True, name="bank-keepalive").start()
+        logger.info_rank0(
+            f"bank device keepalive: holding clocks awake on {', '.join(devices)}"
+        )
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
@@ -585,17 +643,15 @@ class Engine:
         ):
             cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
         if config.moe_backend == "hybrid" and os.environ.get("FREETOKEN_DEVICE_BANK_LAYERS", "").strip():
-            # The cpu/hybrid executors read expert banks from HOST memory; device-
-            # resident bank layers have no host copy, so hybrid would re-load them
-            # host-side too -- double residency that exhausts RAM (measured).
-            # Per-layer hybrid (host layers only) is the follow-up; until then,
-            # device banks force the plain GPU offload path.
+            # Per-layer hybrid: host-resident layers ride the hybrid PCIe+CPU
+            # co-compute; device-bank layers (no host copy for the CPU executor)
+            # keep the plain GPU offload decode -- gated per layer in
+            # OffloadMoELayer.decode via cache.device_bank_layer_ids.
             logger.info_rank0(
-                "FREETOKEN_DEVICE_BANK_LAYERS active: forcing --moe-backend offload "
-                "(hybrid's CPU executor needs host-resident banks)"
+                "FREETOKEN_DEVICE_BANK_LAYERS + hybrid: device-bank layers decode on "
+                "the GPU offload path; host layers use the hybrid CPU co-compute"
             )
-            object.__setattr__(config, "moe_backend", "offload")
-            decode_target = "gpu"
+            decode_target = "hybrid"
         elif config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -715,6 +771,8 @@ class Engine:
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             if has_device_banks:
                 torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+                # Keepalive devices; the thread itself starts after graph capture.
+                self._bank_keepalive_residency = banks.layer_residency
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)
@@ -725,7 +783,36 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        cache.collect_stats = (
+            config.moe_collect_stats
+            or os.environ.get("FREETOKEN_MOE_COLLECT_STATS", "") == "1"
+        )
+        if cache.collect_stats and not config.moe_collect_stats:
+            # Debug instrumentation (env opt-in): periodic decode miss-rate log.
+            def _stats_loop() -> None:
+                import time
+
+                while True:
+                    time.sleep(15)
+                    try:
+                        with torch.inference_mode():
+                            s = cache.decode_miss_stats()
+                            if s["layer_calls"]:
+                                cache.reset_stats()
+                        if s["layer_calls"]:
+                            logger.info_rank0(
+                                f"moe decode stats: miss_rate={s['miss_rate']:.3f} "
+                                f"active/layer={s['active_per_layer']:.1f} "
+                                f"missing/layer={s['missing_per_layer']:.2f} "
+                                f"calls={s['layer_calls']}"
+                            )
+                    except Exception as exc:
+                        logger.warning_rank0(f"moe-stats thread died: {exc!r}")
+                        return
+
+            import threading
+
+            threading.Thread(target=_stats_loop, daemon=True, name="moe-stats").start()
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
@@ -963,6 +1050,10 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
+        # The bank keepalive's periodic kernel would invalidate the re-capture below.
+        keepalive_pause = getattr(self, "_bank_keepalive_paused", None)
+        if keepalive_pause is not None:
+            keepalive_pause.set()
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
@@ -1009,6 +1100,8 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if keepalive_pause is not None:
+            keepalive_pause.clear()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
