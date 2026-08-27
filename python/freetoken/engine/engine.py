@@ -773,6 +773,18 @@ class Engine:
                 torch.cuda.memory._set_allocator_settings("expandable_segments:True")
                 # Keepalive devices; the thread itself starts after graph capture.
                 self._bank_keepalive_residency = banks.layer_residency
+                # Peer expert compute (opt-in): decode device-bank layers ON the
+                # bank device -- full expert set resident there, so no misses and
+                # no P2P weight traffic; only activations cross the bus.
+                if os.environ.get("FREETOKEN_PEER_EXPERT_COMPUTE", "") == "1":
+                    cache.peer_compute = True
+                    cache.peer_max_tokens = max(
+                        config.max_running_req, config.cuda_graph_max_bs or 0, 1
+                    )
+                    logger.info_rank0(
+                        "peer expert compute: device-bank layers decode on their "
+                        "bank device (raw-id GEMV over the full resident expert set)"
+                    )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)

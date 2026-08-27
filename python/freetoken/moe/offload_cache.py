@@ -203,6 +203,16 @@ class OffloadMoeCache:
         # executor reads host banks) must skip them -- they decode on the plain GPU
         # offload path. Derived in set_bank_sources.
         self.device_bank_layer_ids: frozenset = frozenset()
+        # Peer expert compute (FREETOKEN_PEER_EXPERT_COMPUTE=1): decode a
+        # device-bank layer's experts ON the bank device (its full expert set is
+        # resident there -- no misses, no P2P weight traffic; only KB-scale
+        # activations cross the bus). The engine sets peer_compute/peer_max_tokens;
+        # per-device buffer contexts build lazily on the first eager decode, before
+        # CUDA graph capture (capture-time allocation would land in the wrong pool).
+        self.peer_compute = False
+        self.peer_max_tokens = 1
+        self.device_bank_device: dict[int, torch.device] = {}
+        self._peer_ctxs: dict[torch.device, "_PeerComputeCtx"] = {}
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -331,6 +341,11 @@ class OffloadMoeCache:
         self.device_bank_layer_ids = frozenset(
             i for i, r in enumerate(residency) if str(r).startswith(DEVICE_LABEL_PREFIX)
         )
+        self.device_bank_device = {
+            i: torch.device(str(r)[len(DEVICE_LABEL_PREFIX):])
+            for i, r in enumerate(residency)
+            if str(r).startswith(DEVICE_LABEL_PREFIX)
+        }
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -572,6 +587,34 @@ class OffloadMoeCache:
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
+
+    def peer_bank_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """The layer's FULL resident bank tensors on its bank device, in schema
+        order -- indexed by raw expert ids (no slot cache involved)."""
+        return tuple(self.bank_sources[name][layer_id] for name in self.bank_schema)
+
+    def peer_compute_ctx(
+        self,
+        device: torch.device,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        two_i: int,
+    ) -> "_PeerComputeCtx":
+        """Static buffers + stream/events for peer expert compute on ``device``.
+
+        Built lazily on the first (eager) decode call so buffer addresses are
+        stable before CUDA graph capture; shared by every layer resident on that
+        device (decode is layer-sequential, and inside one captured graph the
+        reused events serialize the calls)."""
+        ctx = self._peer_ctxs.get(device)
+        if ctx is None:
+            ctx = _PeerComputeCtx(
+                device, self.device, self.peer_max_tokens,
+                hidden_states, topk_weights, topk_ids, two_i,
+            )
+            self._peer_ctxs[device] = ctx
+        return ctx
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
@@ -1046,6 +1089,43 @@ def iter_offload_moe_layers(model) -> Iterator:
         elif isinstance(value, (list, tuple)):
             for item in value:
                 yield from iter_offload_moe_layers(item)
+
+
+class _PeerComputeCtx:
+    """Fixed-address transfer buffers + decode workspace for one peer bank device.
+
+    Everything a captured multi-device decode graph touches must be preallocated
+    here: capture-time allocations route only to the CAPTURE device's graph pool,
+    so an alloc on the peer device would invalidate the capture."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        serving_device: torch.device,
+        max_tokens: int,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        two_i: int,
+    ) -> None:
+        b = max_tokens
+        h = hidden_states.shape[1]
+        top_k = topk_ids.shape[1]
+        dt = hidden_states.dtype
+        self.hidden = torch.empty((b, h), device=device, dtype=dt)
+        self.weights = torch.empty((b, top_k), device=device, dtype=topk_weights.dtype)
+        self.ids = torch.empty((b, top_k), device=device, dtype=topk_ids.dtype)
+        # decode GEMV workspace (see _fused_experts_decode_nvfp4)
+        self.ws = (
+            torch.empty((b, top_k, two_i), device=device, dtype=dt),
+            torch.empty((b * top_k, two_i // 2), device=device, dtype=dt),
+            torch.empty((b, top_k, h), device=device, dtype=dt),
+            torch.empty((b, h), device=device, dtype=dt),
+        )
+        self.out = torch.empty((b, h), device=serving_device, dtype=dt)
+        self.stream = torch.cuda.Stream(device=device)
+        self.ev_in = torch.cuda.Event()
+        self.ev_out = torch.cuda.Event()
 
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:

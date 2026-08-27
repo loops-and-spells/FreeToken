@@ -307,6 +307,10 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+        # Peer expert compute: a device-bank layer's FULL expert set is resident
+        # on the bank device -- compute there (no misses, no P2P weight traffic).
+        if cache.peer_compute and self.layer_id in cache.device_bank_layer_ids:
+            return self._decode_peer(cache, hidden_states, topk_weights, topk_ids)
         # Device-bank layers have no host copy for the hybrid CPU executor to read;
         # they stay on the plain GPU offload path (per-layer hybrid).
         if cache.decode_target == "hybrid" and self.layer_id not in cache.device_bank_layer_ids:
@@ -323,6 +327,54 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _decode_peer(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expert-parallel decode for a device-bank layer: ship the activations
+        (KB) to the bank device, run the GEMV there against its FULL resident
+        expert set (raw expert ids -- no slot cache, no misses), ship the partial
+        back. Event-linked streams keep the whole round trip inside the serving
+        device's captured decode graph (all peer-side buffers are preallocated:
+        capture-time allocs route only to the capture device's pool)."""
+        from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+        assert cache.quant_format == "nvfp4", (
+            f"peer expert compute supports the native nvfp4 triton banks, "
+            f"got {cache.quant_format!r}"
+        )
+        dev = cache.device_bank_device[self.layer_id]
+        views = cache.peer_bank_views(self.layer_id)
+        ctx = cache.peer_compute_ctx(
+            dev, hidden_states, topk_weights, topk_ids, views[0].shape[1]
+        )
+        n = hidden_states.shape[0]
+        s_here = torch.cuda.current_stream()
+        ctx.ev_in.record(s_here)
+        act_alpha = getattr(self, "hidden_act_alpha", 1.702)
+        act_limit = getattr(self, "swiglu_limit", None)
+        act_limit = float("inf") if act_limit is None else act_limit
+        with torch.cuda.device(dev), torch.cuda.stream(ctx.stream):
+            ctx.stream.wait_event(ctx.ev_in)
+            h0 = ctx.hidden[:n]
+            h0.copy_(hidden_states, non_blocking=True)
+            w0 = ctx.weights[:n]
+            w0.copy_(topk_weights, non_blocking=True)
+            i0 = ctx.ids[:n]
+            i0.copy_(topk_ids, non_blocking=True)
+            out0 = fused_experts_decode_nvfp4_marlin(
+                h0, *views, w0, i0,
+                self.activation, self.apply_router_weight_on_input,
+                act_alpha, act_limit, workspace=ctx.ws,
+            )
+            ctx.out[:n].copy_(out0, non_blocking=True)
+            ctx.ev_out.record(ctx.stream)
+        s_here.wait_event(ctx.ev_out)
+        return ctx.out[:n]
 
     def _decode_hybrid(
         self,
