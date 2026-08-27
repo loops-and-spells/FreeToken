@@ -118,6 +118,13 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        # Static export buffer for the model's post-norm hidden (MTP draft input).
+        # A python-level `model.last_hidden` binding is NOT replay-safe: the
+        # captured intermediate's block belongs to the graph pool and its
+        # contents after replay are whatever the pool reused it for (measured:
+        # 0/256 argmax agreement with the live logits). A captured copy into
+        # this buffer refreshes it on every replay, like logits.
+        self.buffer_hidden: torch.Tensor | None = None
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -173,10 +180,22 @@ class GraphRunner:
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
+                export_hidden = getattr(model, "mtp_enabled", False) and hasattr(
+                    model, "last_hidden"
+                )
+                if export_hidden and self.buffer_hidden is None:
+                    # Allocated OUTSIDE the capture (stable address, normal pool).
+                    self.buffer_hidden = torch.empty(
+                        (self.max_graph_bs, *model.last_hidden.shape[1:]),
+                        dtype=model.last_hidden.dtype,
+                        device=self.device,
+                    )
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
+                    if export_hidden:
+                        self.buffer_hidden[:bs].copy_(model.last_hidden)
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory

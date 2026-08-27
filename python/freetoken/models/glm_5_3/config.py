@@ -80,6 +80,25 @@ def parse_config(hf_config: Any) -> ModelConfig:
     dsa = _dsa_on(args, num_layers)
     kpool = args.index_kpool if dsa else 0
 
+    # MTP draft layer (index == num_layers): a DSA block with deepseek-MTP
+    # wrappers and its own routed expert set (checkpoint layer 45). Opt-in;
+    # needs the full stack (no dev layer cap) and the DSA path.
+    mtp = (
+        os.getenv("FREETOKEN_GLM_MTP", "0") == "1"
+        and dsa
+        and num_layers == text.num_hidden_layers
+        and int(getattr(text, "num_nextn_predict_layers", 0)) >= 1
+    )
+    mtp_layer_id = num_layers if mtp else None
+    if mtp:
+        # The MTP layer's latent KV + index slabs ride the sparse group's pools,
+        # and it owns an indexer (checkpoint has the full indexer key set) -- the
+        # dsa backend's slot walk and Glm53Attention read indexer_types[45].
+        import dataclasses
+
+        sparse_ids = sparse_ids + (mtp_layer_id,)
+        args = dataclasses.replace(args, indexer_types=args.indexer_types + ("full",))
+
     # NoPE: rotary_dim 0 -- no rope table is ever built; the field only sizes specs.
     rotary_config = RotaryConfig(
         head_dim=args.qk_head_dim,
@@ -156,6 +175,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         has_attn_bias=bool(getattr(text, "attention_bias", False)),
         attention_groups=groups,
         glm_dsa_args=args,
+        mtp_layer_id=mtp_layer_id,
+        extra_moe_layers=1 if mtp else 0,
     )
 
 

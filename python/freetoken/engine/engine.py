@@ -1120,6 +1120,10 @@ class Engine:
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
+                if self.graph_runner.buffer_hidden is not None:
+                    # Replay refreshed the static hidden export, not the stale
+                    # capture-time python binding (see GraphRunner.buffer_hidden).
+                    self.model.last_hidden = self.graph_runner.buffer_hidden
             else:
                 logits = self.model.forward()
         if self.cpu_moe_executor is not None:
@@ -1132,10 +1136,84 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if getattr(self.model, "mtp_enabled", False):
+            self._mtp_observe(batch, next_tokens_gpu)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _mtp_observe(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
+        """M1 (measurement mode): run the MTP draft layer alongside normal decoding
+        and log its next-token acceptance rate. No speculation yet -- the draft is
+        compared against the token the MAIN model actually samples one step later.
+        The draft pass also maintains the MTP layer's KV (it appends its row at
+        the batch's out_loc), so later drafts attend over complete history.
+
+        Single-sequence only (the captured last_hidden binding is the bs=1
+        graph's) and fresh single-chunk prefills only; anything else clears the
+        pending draft so no stale comparison is recorded."""
+        if not hasattr(self, "_mtp_pending"):
+            self._mtp_pending: dict = {}
+            # (scored, hits) split by which pass produced the draft: prefill
+            # drafts ride clean eager metadata, decode drafts ride the replayed
+            # decode metadata -- a large accuracy gap between them localizes a
+            # metadata bug to the decode path.
+            self._mtp_stats = {"prefill": [0, 0], "decode": [0, 0]}
+        if batch.size != 1:
+            self._mtp_pending.clear()
+            return
+        req = batch.reqs[0]
+        model = self.model
+        if batch.is_decode:
+            pending = self._mtp_pending.pop(req.uid, None)
+            sampled = int(next_tokens_gpu[0].item())
+            if pending is not None:
+                origin, tok = pending
+                stats = self._mtp_stats[origin]
+                stats[0] += 1
+                stats[1] += int(tok == sampled)
+                if (stats[0] & 63) == 0:
+                    p, d = self._mtp_stats["prefill"], self._mtp_stats["decode"]
+                    h = self._mtp_stats.get("hidden_chk", [0, 0])
+                    logger.info_rank0(
+                        "mtp acceptance: "
+                        f"prefill {p[1]}/{p[0]}"
+                        f" decode {d[1]}/{d[0]}"
+                        f" hidden_chk {h[1]}/{h[0]}"
+                    )
+            hidden = model.last_hidden[: batch.size]
+            # Binding sanity: recomputing the MAIN logits from the stashed hidden
+            # must reproduce the step's distribution -- its argmax should match
+            # the sampled token most of the time. A near-zero match rate means
+            # the graph-replay last_hidden binding is stale, not the MTP math.
+            with self.ctx.forward_batch(batch):
+                chk = int(model.lm_head.forward(hidden)[0].argmax().item())
+            dbg = self._mtp_stats.setdefault("hidden_chk", [0, 0])
+            dbg[0] += 1
+            dbg[1] += int(chk == sampled)
+            with self.ctx.forward_batch(batch):
+                draft_logits = model.mtp_draft(hidden, next_tokens_gpu[:1])
+            self._mtp_pending[req.uid] = ("decode", int(draft_logits[-1].argmax().item()))
+            return
+        # Prefill: MTP consumes (hidden_i, embed(token_{i+1})) for every extend
+        # position -- the last pair uses the just-sampled token. Radix-cached
+        # prefixes are fine: their pages already hold the MTP rows written by
+        # the request that created them (all prefills run this pass). Only a
+        # CHUNKED prefill (extend shorter than the remaining prompt) is skipped.
+        # req.cached_len was already advanced by complete_one() above, so a
+        # completed (unchunked-remainder) prefill shows cached_len == prompt
+        # length; a mid-chunk extend has not consumed the prompt yet -> skip.
+        num_tokens = batch.input_ids.shape[0]
+        if req.cached_len != req.input_ids.shape[0]:
+            self._mtp_pending.pop(req.uid, None)
+            return
+        shifted = torch.cat(
+            [batch.input_ids[1:], next_tokens_gpu[:1].to(batch.input_ids.dtype)]
+        )
+        with self.ctx.forward_batch(batch):
+            draft_logits = model.mtp_draft(model.last_hidden[:num_tokens], shifted)
+        self._mtp_pending[req.uid] = ("prefill", int(draft_logits[-1].argmax().item()))
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

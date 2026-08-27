@@ -183,10 +183,15 @@ def create_kvcache_pool(
         # like the MHA pool below. ``layer_ids`` was computed above when the model has
         # linear attention; a pure-MLA model passes None (all layers backed).
         mla_layer_ids = layer_ids if model_config.has_linear_attention else None
+        # A served MTP layer addresses the pool at id num_layers (one past the
+        # main stack); widen the layer-id space so its remap slot exists.
+        num_kv_layers = model_config.num_layers + (
+            1 if getattr(model_config, "mtp_layer_id", None) is not None else 0
+        )
         if spec.index_head_dim > 0 and spec.num_index_layers > 0:
             return DSAKVCache(
                 latent_dim=spec.head_dim,
-                num_layers=model_config.num_layers,
+                num_layers=num_kv_layers,
                 num_pages=num_pages,
                 page_size=page_size,
                 dtype=dtype,
@@ -198,7 +203,7 @@ def create_kvcache_pool(
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,
-            num_layers=model_config.num_layers,
+            num_layers=num_kv_layers,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,

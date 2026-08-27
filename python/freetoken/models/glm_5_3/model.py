@@ -118,6 +118,37 @@ class Glm53DecoderLayer(BaseOP):
         return self.ffn_hc.post(y, residual, post, comb)
 
 
+class Glm53MTPLayer(BaseOP):
+    """The trailing MTP draft layer (checkpoint layer ``num_layers``): DeepSeek-MTP
+    wrappers around a plain (no-mHC) DSA decoder block with its own routed expert
+    set (the trailing offload bank). Draft input pairs the main model's post-norm
+    hidden at position ``i`` with the embedding of token ``i+1``; the output goes
+    through ``shared_head_norm`` into the shared lm_head for the draft logits."""
+
+    def __init__(self, config: ModelConfig, layer_id: int):
+        from freetoken.models.quant_linear import make_replicated
+
+        h = config.hidden_size
+        self.enorm = RMSNorm(h, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(h, eps=config.rms_norm_eps)
+        self.eh_proj = make_replicated(config, 2 * h, h)
+        self.input_layernorm = RMSNorm(h, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(h, eps=config.rms_norm_eps)
+        self.self_attn = Glm53Attention(config, layer_id)
+        self.mlp = Glm53SparseBlock(config, layer_id)
+        self.shared_head_norm = RMSNorm(h, eps=config.rms_norm_eps)
+
+    def forward(self, hidden: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        x = self.eh_proj.forward(
+            torch.cat([self.enorm.forward(emb), self.hnorm.forward(hidden)], dim=-1)
+        )
+        y = self.input_layernorm.forward(x)
+        x = x + self.self_attn.forward(y)
+        y = self.post_attention_layernorm.forward(x)
+        x = x + self.mlp.forward(y)
+        return self.shared_head_norm.forward(x)
+
+
 class Glm53Model(BaseOP):
     def __init__(self, config: ModelConfig):
         self._hc_mult = config.glm_dsa_args.hc_mult
@@ -129,6 +160,8 @@ class Glm53Model(BaseOP):
             [Glm53DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if config.mtp_layer_id is not None:
+            self.mtp = Glm53MTPLayer(config, config.mtp_layer_id)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
@@ -142,6 +175,7 @@ class Glm53Model(BaseOP):
 
 class Glm5NextForConditionalGeneration(BaseLLMModel):
     def __init__(self, config: ModelConfig):
+        self.mtp_enabled = config.mtp_layer_id is not None
         self.model = Glm53Model(config)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -157,11 +191,26 @@ class Glm5NextForConditionalGeneration(BaseLLMModel):
         for layer in self.model.layers.op_list:
             if not layer._is_linear:
                 layer.self_attn.prepare_for_runtime()
+        if getattr(self.model, "mtp", None) is not None:
+            self.model.mtp.self_attn.prepare_for_runtime()
         torch.cuda.empty_cache()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        # Stashed for the MTP draft pass (post-norm hidden, pre-lm_head). During
+        # CUDA graph capture this binds the graph-pool tensor, whose contents
+        # refresh on every replay -- the reference stays valid.
+        self.last_hidden = output
         return self.lm_head.forward(output)
+
+    def mtp_draft(self, hidden: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        """Draft logits: MTP block over (main hidden at the batch's positions,
+        embedding of the tokens sampled for the NEXT positions). Runs inside the
+        same forward-batch ctx as the main pass -- the MTP layer's KV row is
+        written at the same out_loc, and its attention reads the same metadata."""
+        emb = self.model.embed_tokens.forward(token_ids)
+        out = self.model.mtp.forward(hidden, emb)
+        return self.lm_head.forward(out)
 
 
 __all__ = ["Glm5NextForConditionalGeneration"]

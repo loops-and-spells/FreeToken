@@ -79,7 +79,7 @@ _KDA_FUSIONS: dict[str, tuple[str, ...]] = {
 _MTP_SUFFIXES = (".eh_proj.weight", ".enorm.weight", ".hnorm.weight", ".shared_head.norm.weight")
 
 
-def _rename(raw_name: str, num_layers: int) -> str | None:
+def _rename(raw_name: str, num_layers: int, mtp_layer_id: int | None = None) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith(("model.visual.", "visual.", "mtp.")):
         return None
@@ -90,7 +90,16 @@ def _rename(raw_name: str, num_layers: int) -> str | None:
         name = "model." + name[len("language_model.") :]
     m = _LAYER_RE.match(name)
     if m and int(m.group(1)) >= num_layers:
-        return None  # trailing MTP layer (and any dev-capped tail)
+        if mtp_layer_id is not None and int(m.group(1)) == mtp_layer_id:
+            # Served MTP layer -> the model.mtp module (deepseek-MTP wrappers plus
+            # a plain DSA decoder block; no mHC keys exist on this layer).
+            suffix = name[len(f"model.layers.{mtp_layer_id}.") :]
+            if suffix == "shared_head.norm.weight":
+                suffix = "shared_head_norm.weight"
+            elif suffix == "mlp.gate.e_score_correction_bias":
+                suffix = "mlp.e_score_correction_bias"
+            return "model.mtp." + suffix
+        return None  # trailing MTP layer (not served) or dev-capped tail
     if name.endswith(_MTP_SUFFIXES):
         return None
     for suffix, repl in _HC_RENAMES.items():
@@ -146,7 +155,7 @@ def iter_weights(
             for raw_name in f.keys():
                 if _EXPERT_RE.search(raw_name):
                     continue  # routed experts -> offload cache
-                name = _rename(raw_name, num_layers)
+                name = _rename(raw_name, num_layers, config.mtp_layer_id)
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)
@@ -176,8 +185,9 @@ _NVFP4_EXPERT_KEY_RE = re.compile(
 )
 def _nvfp4_layer_to_bank(layer: int, config) -> int | None:
     """Bank index = MoE layer (global minus the dense prefix). The trailing MTP
-    layer (checkpoint layer 45) carries its own NVFP4 experts -- outside the
-    served text stack, so it maps to None (skipped), not an error."""
+    layer (checkpoint layer 45) carries its own NVFP4 experts: when the MTP
+    layer is served (config.extra_moe_layers == 1) num_moe_layers covers it and
+    it lands in the trailing bank; otherwise it maps to None (skipped)."""
     bank = layer - config.first_k_dense_replace
     if bank < 0 or bank >= config.num_moe_layers:
         return None

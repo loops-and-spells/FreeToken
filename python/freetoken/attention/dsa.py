@@ -104,8 +104,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         if self.dsa_enabled:
             lead = None
             # Capped to the SERVED layer count (dev num_layers overrides must not
-            # index slots past the pool the factory sized from the same cap).
-            for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
+            # index slots past the pool the factory sized from the same cap). A
+            # served MTP layer sits one past num_layers and owns a slot too.
+            served = config.num_layers + (
+                1 if getattr(config, "mtp_layer_id", None) is not None else 0
+            )
+            for lid, kind in enumerate(args.indexer_types[:served]):
                 if kind == "linear":
                     # Hybrid models (GLM-5.3): linear-attention layers never reach
                     # this backend -- no slot, no leader.

@@ -256,6 +256,15 @@ class ModelConfig:
     first_k_dense_replace: int = 0
     # Always-on shared expert(s) added to every MoE layer's output (GLM-4: 1).
     n_shared_experts: int = 0
+    # MTP (multi-token-prediction) draft layer, when SERVED: its global layer id
+    # (== num_layers -- it sits after the main stack). None -> not served. The
+    # layer joins an attention group (its KV rides the same pools) and, when it
+    # owns a MoE block, contributes ``extra_moe_layers`` trailing expert banks.
+    mtp_layer_id: int | None = None
+    # Extra offload-cache expert bank layers beyond the main stack's MoE layers
+    # (an MTP layer with its own expert set: 1). The MTP layer's bank index is
+    # ``mtp_layer_id - first_k_dense_replace`` -- the natural trailing slot.
+    extra_moe_layers: int = 0
     # Selected-expert weights are multiplied by this after renormalization (GLM-4: 2.5).
     routed_scaling_factor: float = 1.0
     # Group-limited routing (DeepSeek-V3 noaux_tc); GLM-4 uses n_group=topk_group=1 so the
@@ -306,8 +315,9 @@ class ModelConfig:
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+        A served MTP layer with its own expert set adds ``extra_moe_layers``.
         """
-        return self.num_layers - self.first_k_dense_replace
+        return self.num_layers - self.first_k_dense_replace + self.extra_moe_layers
 
     @property
     def is_multimodal(self) -> bool:
