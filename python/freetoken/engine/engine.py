@@ -506,21 +506,6 @@ class Engine:
         spec = os.environ.get("FREETOKEN_DEVICE_BANK_LAYERS", "").strip()
         if not spec:
             return requested_residency
-        dev_str, _, count_str = spec.rpartition("=")
-        count = int(count_str)
-        if count <= 0:
-            return requested_residency
-        device = torch.device(dev_str)
-        assert device.type == "cuda" and device.index is not None, spec
-        assert device.index != self.device.index, (
-            "device banks must live on a DIFFERENT card than the serving device"
-        )
-        if not torch.cuda.can_device_access_peer(self.device.index, device.index):
-            raise RuntimeError(
-                f"FREETOKEN_DEVICE_BANK_LAYERS: no P2P access from {self.device} "
-                f"to {device}; the copy kernels cannot read peer banks"
-            )
-        _enable_peer_access(self.device, device.index)
 
         from freetoken.moe.host_banks import DEVICE_LABEL_PREFIX, HostResidency
 
@@ -528,15 +513,33 @@ class Engine:
         labels = list(requested_residency) if requested_residency is not None else [
             HostResidency.PINNED.value
         ] * num
-        label = f"{DEVICE_LABEL_PREFIX}{dev_str}"
-        placed = 0
-        for i in range(num - 1, -1, -1):
-            if placed >= count:
-                break
-            if i in cpu_layer_ids:
+        cursor = num - 1
+        placed_total = 0
+        for part in spec.split(","):
+            dev_str, _, count_str = part.strip().rpartition("=")
+            count = int(count_str)
+            if count <= 0:
                 continue
-            labels[i] = label
-            placed += 1
+            device = torch.device(dev_str)
+            assert device.type == "cuda" and device.index is not None, part
+            if device.index != self.device.index:
+                # Peer banks: the copy kernels dereference the other card's
+                # memory, which needs an explicit peer mapping. Banks on the
+                # SERVING device itself are plain local VRAM -- no mapping.
+                if not torch.cuda.can_device_access_peer(self.device.index, device.index):
+                    raise RuntimeError(
+                        f"FREETOKEN_DEVICE_BANK_LAYERS: no P2P access from "
+                        f"{self.device} to {device}"
+                    )
+                _enable_peer_access(self.device, device.index)
+            label = f"{DEVICE_LABEL_PREFIX}{dev_str}"
+            placed = 0
+            while cursor >= 0 and placed < count:
+                if cursor not in cpu_layer_ids:
+                    labels[cursor] = label
+                    placed += 1
+                cursor -= 1
+            placed_total += placed
         if config.moe_prefill_overlap:
             logger.info_rank0(
                 "FREETOKEN_DEVICE_BANK_LAYERS: disabling MoE prefill overlap "
@@ -550,8 +553,8 @@ class Engine:
             )
             object.__setattr__(config.model_config, "nvfp4_backend", "triton")
         logger.info_rank0(
-            f"device banks: {placed} trailing MoE layers' banks settle on {dev_str}; "
-            f"the remaining {num - placed} stay in host RAM"
+            f"device banks: {placed_total} trailing MoE layers' banks settle on CUDA "
+            f"devices ({spec}); the remaining {num - placed_total} stay in host RAM"
         )
         return labels
 

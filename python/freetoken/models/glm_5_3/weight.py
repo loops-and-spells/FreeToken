@@ -174,10 +174,20 @@ _NVFP4_EXPERT_KEY_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
+def _nvfp4_layer_to_bank(layer: int, config) -> int | None:
+    """Bank index = MoE layer (global minus the dense prefix). The trailing MTP
+    layer (checkpoint layer 45) carries its own NVFP4 experts -- outside the
+    served text stack, so it maps to None (skipped), not an error."""
+    bank = layer - config.first_k_dense_replace
+    if bank < 0 or bank >= config.num_moe_layers:
+        return None
+    return bank
+
+
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_NVFP4_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: layer - config.first_k_dense_replace,
+    layer_to_bank=_nvfp4_layer_to_bank,
     desc="GLM-5.3 NVFP4 experts",
 )
 

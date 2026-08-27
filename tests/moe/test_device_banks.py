@@ -78,7 +78,7 @@ def test_engine_overlay_parses_and_labels(monkeypatch):
 
     from freetoken.engine.engine import Engine
 
-    monkeypatch.setenv("FREETOKEN_DEVICE_BANK_LAYERS", "cuda:0=2")
+    monkeypatch.setenv("FREETOKEN_DEVICE_BANK_LAYERS", "cuda:0=1,cuda:1=1")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("needs 2 GPUs for the peer-access probe")
     self = SimpleNamespace(device=torch.device("cuda", 1))
@@ -87,8 +87,9 @@ def test_engine_overlay_parses_and_labels(monkeypatch):
         moe_prefill_overlap=False,
     )
     labels = Engine._overlay_device_bank_layers(self, config, None, frozenset({4}))
-    # trailing non-CPU layers get the device label; the CPU layer is skipped
+    # devices fill from the tail in spec order; the CPU layer is skipped; banks
+    # on the serving device (cuda:1) need no peer mapping
     assert labels == [
-        "pinned", "pinned", f"{DEVICE_LABEL_PREFIX}cuda:0",
+        "pinned", "pinned", f"{DEVICE_LABEL_PREFIX}cuda:1",
         f"{DEVICE_LABEL_PREFIX}cuda:0", "pinned",
     ]

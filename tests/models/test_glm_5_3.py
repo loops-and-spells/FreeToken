@@ -516,6 +516,10 @@ def test_nvfp4_source_spec_matches_checkpoint_keys():
     # bank index is the MoE layer (global minus the dense prefix)
     class _C:
         first_k_dense_replace = 3
+        num_moe_layers = 42
 
     assert _NVFP4_SOURCE_SPEC.layer_to_bank(3, _C) == 0
     assert _NVFP4_SOURCE_SPEC.layer_to_bank(44, _C) == 41
+    # the MTP layer (45) carries its own experts in the checkpoint: skipped
+    assert _NVFP4_SOURCE_SPEC.layer_to_bank(45, _C) is None
+    assert _NVFP4_SOURCE_SPEC.layer_to_bank(0, _C) is None
