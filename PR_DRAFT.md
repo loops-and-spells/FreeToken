@@ -53,9 +53,11 @@ layer is not loaded (no speculative decoding in v1).
 * **Full 45-layer serving** (LibertAIDAI/GLM-5.3-Flash-NVFP4, 181 GiB): on a
   single 96 GB serving GPU + a second card holding 22 MoE layers' expert banks
   device-resident (the new multi-device bank placement) + ~76 GiB pinned host
-  RAM. Coherent thinking-mode answers, **~38 tok/s decode** (CUDA graphs +
-  peer expert compute; ~29 tok/s without peer compute at ~24% expert-cache
-  miss rate), steady across requests. This checkpoint
+  RAM. Coherent thinking-mode answers, **~45 tok/s decode** (CUDA graphs +
+  peer expert compute + k=1 MTP speculation at 78-82% draft acceptance;
+  ~38 without speculation, ~29 without peer compute), steady across requests;
+  ~40 tok/s when sized for 128k context (the k-pool indexer scores over the
+  full table width each step -- a fused pooled-key kernel is the follow-up). This checkpoint
   stores per-expert NVFP4 with a separate expert set on the trailing MTP layer,
   which the source spec maps to None (skipped).
 * Full suite: no regressions (the one failing test on my machine,
@@ -106,6 +108,17 @@ welcome from anyone with the RAM.
   of order and defeats the migrate-and-drop RAM pacing), and
   `FREETOKEN_KERNEL_CACHE_JOBS` caps the first-boot kernel-compile fan-out
   (defaults to all cores; each job is a compiler using real RAM).
+
+* **MTP layer + k=1 speculative decoding** (`FREETOKEN_GLM_MTP=1` +
+  `FREETOKEN_GLM_SPEC=1`, requires `FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1`):
+  checkpoint layer 45 (deepseek-MTP wrappers around a no-mHC DSA block with
+  its own expert set) is served as a draft head; each decode step verifies the
+  draft in ONE captured two-token decode-phase forward (the sparse kernel's
+  m-dimension + per-query causality; KDA runs the tokens as sequential
+  single-token kernel calls with a mid-state stash so a rejected draft rolls
+  back to the state AFTER the committed token). 78-82% live acceptance, 1.8
+  tokens/step. v1 limits: bs==1, engages below index_topk tokens of context,
+  synchronous scheduler loop.
 
 ## Known limits / follow-ups
 
