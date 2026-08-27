@@ -8,7 +8,7 @@ no speculative head in v1.
 Per layer kind:
 
 * **KDA layers** (all-bf16 in the FP8 checkpoint): ``q/k/v_proj`` concatenate into
-  the fused ``in_proj_qkv`` GEMM, ``q/k/v_convNd`` into the depthwise ``conv1d``
+  the fused ``in_proj_qkv`` GEMM, ``q/k/v_conv1d`` into the depthwise ``conv1d``
   (order q|k|v, matching the fused split); the low-rank gates, ``A_log`` /
   ``dt_bias`` (fp32-exempt from the model-dtype downcast), ``o_norm`` and
   ``o_proj`` stream through verbatim.
@@ -65,7 +65,7 @@ _KDA_FUSIONS: dict[str, tuple[str, ...]] = {
         ".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight",
     ),
     ".self_attn.conv1d.weight": (
-        ".self_attn.q_convNd.weight", ".self_attn.k_convNd.weight", ".self_attn.v_convNd.weight",
+        ".self_attn.q_conv1d.weight", ".self_attn.k_conv1d.weight", ".self_attn.v_conv1d.weight",
     ),
 }
 
