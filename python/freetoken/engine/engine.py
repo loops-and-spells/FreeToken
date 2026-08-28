@@ -1322,6 +1322,21 @@ class Engine:
             with self.ctx.forward_batch(vb):
                 out = model.forward()  # eager warmup for this m's specializations
                 self._spec_logits_buf[:m].copy_(out[:m])
+                if (
+                    m == m_max
+                    and os.environ.get("FREETOKEN_GLM_SPEC_PROFILE", "") == "1"
+                ):
+                    # Name the kernels the m_max verify actually spends time in.
+                    from torch.profiler import ProfilerActivity, profile
+
+                    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                        model.forward()
+                    rows = prof.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=18,
+                        max_name_column_width=60,
+                    )
+                    for line in rows.splitlines():
+                        logger.info_rank0(f"spec profile: {line}")
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     out = model.forward()
