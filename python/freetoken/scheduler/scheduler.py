@@ -390,11 +390,14 @@ class Scheduler(SchedulerIOMixin):
                 )
 
                 if not finished and spec_extra is not None and i == 0:
-                    # Accepted speculative bonus token (bs == 1): same per-token
-                    # bookkeeping as the main token, one position later.
-                    finished = self._process_spec_extra(
-                        req, spec_extra[1], reply, new_finished_reqs
-                    )
+                    # Accepted speculative bonus tokens (bs == 1): same
+                    # per-token bookkeeping as the main token, in order.
+                    for tok_cpu in spec_extra[1]:
+                        finished = self._process_spec_extra(
+                            req, tok_cpu, reply, new_finished_reqs
+                        )
+                        if finished:
+                            break
                     if finished:
                         continue  # _process_spec_extra freed the request
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -944,22 +947,25 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         spec = self.engine.spec_will_verify(batch)
         if spec:
-            # The verify forward writes KV one position ahead; allocate that page
-            # now and free it on reject so the allocator's one-page-per-step
-            # invariant (and every free/caching path built on it) is preserved.
-            self.cache_manager.allocate_spec_lookahead(batch.reqs[0])
+            # The verify forward writes the draft tokens' KV rows and the chain
+            # drafts' MTP rows ahead of device_len; allocate the lookahead span
+            # now and trim it back to the post-step device_len afterwards, so
+            # the allocator's positions-below-device_len invariant holds
+            # between steps.
+            self.cache_manager.allocate_spec_lookahead(
+                batch.reqs[0], self.engine.spec_lookahead_pages()
+            )
         forward_output = self.engine.forward_batch(batch, sample_args)
         if spec:
-            if forward_output.spec_extra is None:
-                self.cache_manager.free_spec_lookahead(batch.reqs[0])
-            else:
-                batch.reqs[0].spec_lookahead_pos = None  # became a normal page
+            self.cache_manager.free_spec_lookahead(batch.reqs[0])
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         if forward_output.spec_extra is not None:
-            # Accepted speculative bonus token: lands one position after the
-            # main token so the next step's input read finds it (bs == 1).
+            # Accepted speculative bonus tokens: land after the main token so
+            # the next step's input read finds the newest one (bs == 1).
             idx, pos = output_mapping
-            self.token_pool[idx, pos + 1] = forward_output.spec_extra[0]
+            extra_gpu = forward_output.spec_extra[0]
+            for i in range(extra_gpu.shape[0]):
+                self.token_pool[idx, pos + 1 + i] = extra_gpu[i]
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

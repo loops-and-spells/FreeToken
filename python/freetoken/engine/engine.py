@@ -1164,20 +1164,25 @@ class Engine:
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    # k-draft speculative decoding (chained MTP): FREETOKEN_GLM_SPEC_K drafts
+    # per step (default 3), verified in one (bs=1, m=k+1) captured forward.
+    SPEC_K = int(os.environ.get("FREETOKEN_GLM_SPEC_K", "3"))
+
     def spec_will_verify(self, batch: Batch) -> bool:
-        """Whether forward_batch will take the k=1 speculative verify path for
-        this batch. The SCHEDULER consults the same predicate before the forward
-        to allocate the verify token's lookahead KV page (and to free it again
-        on reject), keeping the one-page-per-step allocator invariant intact."""
+        """Whether forward_batch will take the speculative verify path for this
+        batch. The SCHEDULER consults the same predicate before the forward to
+        allocate the lookahead KV pages (2k: the verify drafts' rows plus the
+        chain drafts' MTP rows) and trims them back after the step."""
         from freetoken.env import ENV
 
         if not (
             getattr(self.model, "mtp_enabled", False)
             and os.environ.get("FREETOKEN_GLM_SPEC", "") == "1"
             # Overlap scheduling drains a step while the next is in flight; the
-            # bonus-token bookkeeping (and the lookahead page's reject-free) need
-            # the synchronous loop. v1 requires FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1.
+            # bonus-token bookkeeping and the lookahead trim need the
+            # synchronous loop (FREETOKEN_DISABLE_OVERLAP_SCHEDULING=1).
             and ENV.DISABLE_OVERLAP_SCHEDULING
+            and getattr(self, "_spec_graphs", None)
             and batch.is_decode
             and batch.size == 1
             and not getattr(batch, "spec_verify", False)
@@ -1185,34 +1190,43 @@ class Engine:
             return False
         req = batch.reqs[0]
         pend = getattr(self, "_mtp_pending", {}).get(req.uid)
+        if pend is None:
+            return False
+        m = len(pend[1]) + 1
         return (
-            pend is not None
-            # >= 3 keeps the budget boundary clean: after a step consuming 2
-            # tokens at least one remains, so the main token can never be
-            # length-finished while a bonus token exists.
-            and req.remain_len >= 3
-            # v1: shared-selection causality needs the dense identity path or
-            # row-sentinel masking within the selection -- both valid while
+            m in self._spec_graphs
+            # Budget margin: a step consumes at most m tokens; leaving one more
+            # keeps the trailing vanilla steps carrying the length finish.
+            and req.remain_len >= m + 1
+            # Shared-selection causality (row-sentinel masking) is valid while
             # every live position fits the top-k window.
-            and req.device_len + 2 < getattr(
+            and req.device_len + 2 * self.SPEC_K + 1 < getattr(
                 self.config.model_config.glm_dsa_args, "index_topk", 1 << 30
             )
         )
 
-    def _capture_spec_verify_graph(self) -> None:
-        """Capture the (bs=1, m=2) speculative VERIFY forward as a CUDA graph.
+    def spec_lookahead_pages(self) -> int:
+        return 2 * self.SPEC_K
 
-        All addressing lives in dedicated static buffers (input ids, positions,
-        out_loc, GDN slot, page-table row snapshot, kv length); the metadata
-        objects are built once pointing at them, so a replay only needs the
-        buffers refreshed. Captured on the decode graphs' memory pool, after
-        prefill warmup and before the bank keepalive starts. Eager verify was
-        ~2.2x a captured decode step and ate most of the 1.76 tokens/step win."""
-        self._spec_graph = None
+    def _capture_spec_verify_graph(self) -> None:
+        """Capture the speculative-decode graph set on the decode graphs' pool:
+
+        * VERIFY graphs for m = 2 (the single-draft bootstrap step right after
+          prefill) and m = SPEC_K + 1 (steady state) -- one two/four-token
+          decode-phase forward exporting logits + post-norm hidden.
+        * MAINTENANCE graph: the MTP pass over m_max (padded) accepted rows,
+          exporting per-row argmax and the raw (pre-shared_head_norm) MTP
+          hidden -- row `a` seeds the chain.
+        * CHAIN graph: a single-token MTP pass, replayed k-1 times per step to
+          extend the draft chain (the deepseek-MTP recurrence over
+          last_mtp_hidden).
+
+        All addressing lives in static buffers refreshed per replay. Captured
+        after prefill warmup, before the bank keepalive starts."""
+        self._spec_graphs = {}
         if not (
             getattr(self.model, "mtp_enabled", False)
             and os.environ.get("FREETOKEN_GLM_SPEC", "") == "1"
-            and os.environ.get("FREETOKEN_GLM_SPEC_EAGER", "") != "1"
             and self.graph_runner.graph_map
         ):
             return
@@ -1221,225 +1235,270 @@ class Engine:
 
         dev = self.device
         model = self.model
-        self._spec_prepare_mid_buffers()
+        m_max = self.SPEC_K + 1
+        self._spec_prepare_mid_buffers(m_max)
         table_width = self.ctx.page_table.shape[1]
+        cfg = self.config.model_config
         buf = {
-            "input_ids": torch.zeros(2, dtype=torch.int32, device=dev),
-            "positions": torch.zeros(2, dtype=torch.int32, device=dev),
-            "out_loc": torch.zeros(2, dtype=torch.int32, device=dev),
+            "input_ids": torch.zeros(m_max, dtype=torch.int32, device=dev),
+            "positions": torch.zeros(m_max, dtype=torch.int32, device=dev),
+            "out_loc": torch.zeros(m_max, dtype=torch.int32, device=dev),
             "slot": torch.zeros(1, dtype=torch.int32, device=dev),
             "rows": torch.zeros(1, table_width, dtype=torch.int32, device=dev),
             "kvlen": torch.zeros(1, dtype=torch.int32, device=dev),
+            # MTP maintenance inputs (padded to m_max)
+            "mtp_tokens": torch.zeros(m_max, dtype=torch.int32, device=dev),
+            "mtp_loc": torch.zeros(m_max, dtype=torch.int32, device=dev),
+            "mtp_kvlen": torch.zeros(1, dtype=torch.int32, device=dev),
+            # chain inputs (one token per replay)
+            "chain_h": torch.zeros(1, cfg.hidden_size, dtype=self.dtype, device=dev),
+            "chain_tok": torch.zeros(1, dtype=torch.int32, device=dev),
+            "chain_loc": torch.zeros(1, dtype=torch.int32, device=dev),
+            "chain_kvlen": torch.zeros(1, dtype=torch.int32, device=dev),
         }
         dummy = self.dummy_req
         buf["rows"].copy_(self.ctx.page_table[dummy.table_idx : dummy.table_idx + 1])
-        buf["out_loc"].copy_(buf["rows"][0, :2])
-        buf["kvlen"].fill_(2)
+        buf["out_loc"].copy_(buf["rows"][0, :m_max])
+        buf["mtp_loc"].copy_(buf["rows"][0, :m_max])
+        buf["chain_loc"].copy_(buf["rows"][0, :1])
+        buf["kvlen"].fill_(m_max)
+        buf["mtp_kvlen"].fill_(m_max)
+        buf["chain_kvlen"].fill_(1)
         dummy_slot = (
             dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx
         )
         buf["slot"].fill_(dummy_slot)
 
-        batch = Batch(reqs=[dummy], phase="decode")
-        batch.padded_reqs = batch.reqs
-        batch.spec_verify = True
-        batch.input_ids = buf["input_ids"]
-        batch.positions = buf["positions"]
-        batch.out_loc = buf["out_loc"]
-        batch.linear_table_idx = buf["slot"]
-        batch.fla_metadata = FLAMetadata(
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=dev),
-            cache_indices=buf["slot"],
-            has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
-        )
-        md = DSAMetadata(
-            is_decode=True,
-            last_indices=torch.tensor([1], dtype=torch.int64, device=dev),
-            qo_indptr_cpu=torch.tensor([0, 2], dtype=torch.int32),
-            kv_len_cpu=torch.tensor([2], dtype=torch.int32),
-        )
-        md.spec_m = 2
-        md.rows = buf["rows"]
-        md.kvlen = buf["kvlen"]
-        batch.attn_metadata = md
-
-        cfg = self.config.model_config
         self._spec_logits_buf = torch.empty(
-            2, cfg.vocab_size, dtype=torch.float32, device=dev
+            m_max, cfg.vocab_size, dtype=torch.float32, device=dev
         )
         self._spec_hidden_buf = torch.empty(
-            2, cfg.hidden_size, dtype=self.dtype, device=dev
+            m_max, cfg.hidden_size, dtype=self.dtype, device=dev
         )
+        self._spec_maint_argmax = torch.zeros(m_max, dtype=torch.int64, device=dev)
+        self._spec_maint_raw = torch.empty(
+            m_max, cfg.hidden_size, dtype=self.dtype, device=dev
+        )
+        self._spec_chain_argmax = torch.zeros(1, dtype=torch.int64, device=dev)
         pool = next(iter(self.graph_runner.graph_map.values())).pool()
-        with self.ctx.forward_batch(batch):
-            out = model.forward()  # eager warmup: m=2 triton specializations
-            self._spec_logits_buf.copy_(out[:2])
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                out = model.forward()
-                self._spec_logits_buf.copy_(out[:2])
-                self._spec_hidden_buf.copy_(model.last_hidden[:2])
+
+        def _md(n_tokens: int) -> DSAMetadata:
+            md = DSAMetadata(
+                is_decode=True,
+                last_indices=torch.tensor([n_tokens - 1], dtype=torch.int64, device=dev),
+                qo_indptr_cpu=torch.tensor([0, n_tokens], dtype=torch.int32),
+                kv_len_cpu=torch.tensor([n_tokens], dtype=torch.int32),
+            )
+            md.spec_m = n_tokens
+            md.rows = buf["rows"]
+            return md
+
+        def _mk_batch(n_tokens: int, out_loc: torch.Tensor, kvlen: torch.Tensor) -> Batch:
+            b = Batch(reqs=[dummy], phase="decode")
+            b.padded_reqs = b.reqs
+            b.spec_verify = True
+            b.input_ids = buf["input_ids"][:n_tokens]
+            b.positions = buf["positions"][:n_tokens]
+            b.out_loc = out_loc
+            b.linear_table_idx = buf["slot"]
+            b.fla_metadata = FLAMetadata(
+                cu_seqlens=torch.tensor([0, n_tokens], dtype=torch.int32, device=dev),
+                cache_indices=buf["slot"],
+                has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
+            )
+            md = _md(n_tokens)
+            md.kvlen = kvlen
+            b.attn_metadata = md
+            return b
+
+        # --- verify graphs (m = 2 bootstrap, m = m_max steady) -------------
+        self._spec_batches = {}
+        for m in sorted({2, m_max}):
+            vb = _mk_batch(m, buf["out_loc"][:m], buf["kvlen"])
+            with self.ctx.forward_batch(vb):
+                out = model.forward()  # eager warmup for this m's specializations
+                self._spec_logits_buf[:m].copy_(out[:m])
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    out = model.forward()
+                    self._spec_logits_buf[:m].copy_(out[:m])
+                    self._spec_hidden_buf[:m].copy_(model.last_hidden[:m])
+            self.graph_runner._reset_moe_offload_cache()
+            self._spec_graphs[m] = graph
+            self._spec_batches[m] = vb
+
+        # --- MTP maintenance graph (always m_max rows, host-padded) --------
+        mb = _mk_batch(m_max, buf["mtp_loc"], buf["mtp_kvlen"])
+        with self.ctx.forward_batch(mb):
+            dlog = model.mtp_draft(self._spec_hidden_buf, buf["mtp_tokens"])
+            self._spec_maint_argmax.copy_(dlog.argmax(dim=-1))
+            maint_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(maint_graph, pool=pool, stream=self.stream):
+                dlog = model.mtp_draft(self._spec_hidden_buf, buf["mtp_tokens"])
+                self._spec_maint_argmax.copy_(dlog.argmax(dim=-1))
+                self._spec_maint_raw.copy_(model.last_mtp_hidden)
         self.graph_runner._reset_moe_offload_cache()
-        self._spec_batch = batch
+        self._spec_maint_graph = maint_graph
+        self._spec_maint_batch = mb
+
+        # --- chain graph (single-token MTP, replayed k-1 times) ------------
+        cb = _mk_batch(1, buf["chain_loc"], buf["chain_kvlen"])
+        with self.ctx.forward_batch(cb):
+            dlog = model.mtp_draft(buf["chain_h"], buf["chain_tok"])
+            self._spec_chain_argmax.copy_(dlog[-1:].argmax(dim=-1))
+            chain_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(chain_graph, pool=pool, stream=self.stream):
+                dlog = model.mtp_draft(buf["chain_h"], buf["chain_tok"])
+                self._spec_chain_argmax.copy_(dlog[-1:].argmax(dim=-1))
+                buf["chain_h"].copy_(model.last_mtp_hidden[-1:])
+        self.graph_runner._reset_moe_offload_cache()
+        self._spec_chain_graph = chain_graph
+        self._spec_chain_batch = cb
         self._spec_buf = buf
-        self._spec_graph = graph
-        # Second graph: the ACCEPTED-case MTP maintenance + next-draft pass
-        # (~78% of steps). Inputs are the verify graph's hidden export and a
-        # static token pair; the output worth exporting is just the argmax.
-        self._spec_mtp_tokens = torch.zeros(2, dtype=torch.int32, device=dev)
-        self._spec_draft_buf = torch.zeros(1, dtype=torch.int64, device=dev)
-        with self.ctx.forward_batch(batch):
-            dlog = model.mtp_draft(self._spec_hidden_buf, self._spec_mtp_tokens)
-            self._spec_draft_buf.copy_(dlog[-1:].argmax(dim=-1))
-            mtp_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(mtp_graph, pool=pool, stream=self.stream):
-                dlog = model.mtp_draft(self._spec_hidden_buf, self._spec_mtp_tokens)
-                self._spec_draft_buf.copy_(dlog[-1:].argmax(dim=-1))
-        self.graph_runner._reset_moe_offload_cache()
-        self._spec_mtp_graph = mtp_graph
-        logger.info_rank0("spec verify + mtp CUDA graphs captured (bs=1, m=2)")
+        logger.info_rank0(
+            f"spec CUDA graphs captured: verify m={sorted(self._spec_graphs)}, "
+            f"maintenance m={m_max}, chain (k={self.SPEC_K})"
+        )
 
-    def _spec_prepare_mid_buffers(self) -> None:
-        """Per-linear-layer single-slot buffers the KDA op stashes its MID state
-        into during a verify forward (the state AFTER the committed token t,
-        BEFORE the draft d). A rejected draft restores from these -- restoring
-        to before the whole verify would drop t from the recurrence."""
+    def _spec_prepare_mid_buffers(self, m_max: int) -> None:
+        """Per-position, per-linear-layer single-slot stash buffers the KDA op
+        fills during a verify forward (state after token j, j < m-1). A
+        rejected chain restores from the stash of the last ACCEPTED token."""
         pool = self.linear_state_pool
-        if getattr(pool, "spec_mid_conv", None) is None:
-            pool.spec_mid_conv = [torch.empty_like(cs[0:1]) for cs in pool.conv_states]
-            pool.spec_mid_rec = [torch.empty_like(rs[0:1]) for rs in pool.recurrent_states]
+        if getattr(pool, "spec_mid_conv", None) is None or len(pool.spec_mid_conv) < m_max - 1:
+            pool.spec_mid_conv = [
+                [torch.empty_like(cs[0:1]) for cs in pool.conv_states]
+                for _ in range(m_max - 1)
+            ]
+            pool.spec_mid_rec = [
+                [torch.empty_like(rs[0:1]) for rs in pool.recurrent_states]
+                for _ in range(m_max - 1)
+            ]
 
-    def _spec_restore(self, slot_idx: torch.Tensor) -> None:
-        """Reject: roll the GDN slot back to the mid-verify state (includes t)."""
+    def _spec_restore(self, slot_idx: torch.Tensor, stash: int) -> None:
+        """Reject: roll the GDN slot back to the state after token ``stash``
+        (the last accepted one)."""
         pool = self.linear_state_pool
         idx = slot_idx.to(torch.int64)
-        for buf, dst in zip(pool.spec_mid_conv, pool.conv_states):
-            dst.index_copy_(0, idx, buf.to(dst.dtype))
-        for buf, dst in zip(pool.spec_mid_rec, pool.recurrent_states):
-            dst.index_copy_(0, idx, buf.to(dst.dtype))
+        for bufc, dst in zip(pool.spec_mid_conv[stash], pool.conv_states):
+            dst.index_copy_(0, idx, bufc.to(dst.dtype))
+        for bufr, dst in zip(pool.spec_mid_rec[stash], pool.recurrent_states):
+            dst.index_copy_(0, idx, bufr.to(dst.dtype))
 
     def _spec_forward(
-        self, batch: Batch, args: BatchSamplingArgs, draft: int
+        self, batch: Batch, args: BatchSamplingArgs, drafts: list
     ) -> ForwardOutput:
-        """k=1 speculative decode step (eager verify, bs == 1).
+        """Chained speculative decode step (bs == 1, captured graphs only).
 
-        One decode-phase forward over TWO tokens -- the pending token t and the
-        MTP draft d. Row 0's logits sample s1 (the token after t); s1 == d
-        accepts the draft and row 1's logits sample a BONUS token s2. On reject
-        the KDA conv/recurrent states roll back from the pre-forward snapshot;
-        the paged rows written for d's position are dead until the same slot is
-        rewritten next step (lengths never include them). The MTP maintenance
-        pass then writes the MTP layer's rows for every ACCEPTED position and
-        produces the next draft."""
-        from freetoken.attention.dsa import DSAMetadata
-
+        One (m = len(drafts)+1)-token verify forward checks the whole draft
+        chain; the longest accepted prefix plus one bonus token is emitted
+        (1..m tokens). The MTP maintenance graph rewrites the MTP rows for the
+        accepted positions and seeds a fresh k-draft chain via k-1 replays of
+        the single-token chain graph. KDA state rolls back to the stash of the
+        last accepted token when the chain breaks early."""
         req = batch.reqs[0]
-        dev = self.device
         model = self.model
         self._mtp_pending.pop(req.uid, None)
         p = int(batch.positions[0].item())
+        m = len(drafts) + 1
+        m_max = self.SPEC_K + 1
+        buf = self._spec_buf
 
         slot_idx = batch.linear_table_idx
         if slot_idx is None:
             slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-            slot_idx = torch.tensor([slot], dtype=torch.int32, device=dev)
+            slot_idx = torch.tensor([slot], dtype=torch.int32, device=self.device)
 
-        def _md(n_tokens: int, kv_final: int) -> DSAMetadata:
-            md = DSAMetadata(
-                is_decode=True,
-                last_indices=torch.tensor(
-                    [n_tokens - 1], dtype=torch.int64, device=dev
-                ),
-                qo_indptr_cpu=torch.tensor([0, n_tokens], dtype=torch.int32),
-                kv_len_cpu=torch.tensor([kv_final], dtype=torch.int32),
-            )
-            md.spec_m = n_tokens
-            return md
+        # --- verify ---------------------------------------------------------
+        buf["input_ids"][:1].copy_(batch.input_ids)
+        buf["input_ids"][1:m].copy_(
+            torch.tensor(drafts, dtype=torch.int32, device=self.device)
+        )
+        pos_row = torch.arange(m, dtype=torch.int32, device=self.device) + p
+        buf["positions"][:m].copy_(pos_row)
+        buf["slot"].copy_(slot_idx)
+        buf["rows"].copy_(self.ctx.page_table[req.table_idx : req.table_idx + 1])
+        buf["out_loc"][:m].copy_(buf["rows"][0, p : p + m])
+        buf["kvlen"].fill_(p + m)
+        self._spec_graphs[m].replay()
+        logits = self._spec_logits_buf
 
-        self._spec_prepare_mid_buffers()
-        use_graph = getattr(self, "_spec_graph", None) is not None
-        if use_graph:
-            # Replay path: refresh the static addressing buffers, replay the
-            # captured (bs=1, m=2) verify graph, read the exported logits/hidden.
-            vb, buf = self._spec_batch, self._spec_buf
-            buf["input_ids"][:1].copy_(batch.input_ids)
-            buf["input_ids"][1:].fill_(draft)
-            buf["positions"][:1].copy_(batch.positions)
-            buf["positions"][1:].copy_(batch.positions + 1)
-            buf["out_loc"][:1].copy_(batch.out_loc)
-            buf["out_loc"][1:].copy_(self.ctx.page_table[req.table_idx, p + 1].view(1))
-            buf["slot"].copy_(slot_idx)
-            buf["rows"].copy_(self.ctx.page_table[req.table_idx : req.table_idx + 1])
-            buf["kvlen"].fill_(p + 2)
-            self._spec_graph.replay()
-            logits = self._spec_logits_buf
-            hidden = self._spec_hidden_buf
-            mtp_batch = vb
-        else:
-            from freetoken.attention.linear import FLAMetadata
-
-            batch.input_ids = torch.cat(
-                [
-                    batch.input_ids,
-                    torch.tensor([draft], dtype=batch.input_ids.dtype, device=dev),
-                ]
-            )
-            batch.positions = torch.cat([batch.positions, batch.positions + 1])
-            loc2 = self.ctx.page_table[req.table_idx, p + 1].view(1).to(batch.out_loc.dtype)
-            batch.out_loc = torch.cat([batch.out_loc, loc2])
-            batch.spec_verify = True
-            batch.fla_metadata = FLAMetadata(
-                cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=dev),
-                cache_indices=slot_idx,
-                has_initial_state=torch.ones(1, dtype=torch.bool, device=dev),
-            )
-            batch.attn_metadata = _md(2, p + 2)
-            with self.ctx.forward_batch(batch):
-                logits = model.forward()
-            hidden = model.last_hidden
-            mtp_batch = batch
-
-        s1 = self.sampler.sample(logits[0:1], args).to(torch.int32)
-        s1_i = int(s1.item())
-        if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
-            n = getattr(self, "_spec_dbg_n", 0)
-            if n < 12:
-                self._spec_dbg_n = n + 1
-                logger.info_rank0(
-                    f"spec dbg: p={p} t={int(batch.input_ids[0].item())} draft={draft} "
-                    f"s1={s1_i} top0={int(logits[0].argmax().item())} "
-                    f"top1={int(logits[1].argmax().item())}"
-                )
-        req.complete_one()
+        # --- sample all rows, accept the longest prefix ----------------------
+        sampled = torch.cat(
+            [self.sampler.sample(logits[i : i + 1], args) for i in range(m)]
+        ).to(torch.int32)
+        s_cpu = sampled.tolist()  # one sync
         eos = getattr(self, "spec_eos_token_ids", ())
-        accepted = s1_i == draft and s1_i not in eos and req.can_decode
+        a = 0
+        for i in range(m - 1):
+            if s_cpu[i] != drafts[i] or s_cpu[i] in eos:
+                break
+            a += 1
+        n_emit = a + 1  # s_1..s_{a+1}; the last is the bonus from row a
+        for _ in range(n_emit):
+            req.complete_one()
+        if a < m - 1:
+            self._spec_restore(slot_idx, a)
         stats = getattr(self, "_spec_stats", None)
         if stats is None:
-            stats = self._spec_stats = [0, 0]  # steps, accepted
+            stats = self._spec_stats = [0, 0, 0]  # steps, drafts offered, accepted
         stats[0] += 1
-        if accepted:
-            stats[1] += 1
-            s2 = self.sampler.sample(logits[1:2], args).to(torch.int32)
-            req.complete_one()
-        else:
-            self._spec_restore(slot_idx)
+        stats[1] += m - 1
+        stats[2] += a
         if (stats[0] & 255) == 0:
             logger.info_rank0(
-                f"spec decode: accepted {stats[1]}/{stats[0]} "
-                f"({stats[1] / stats[0]:.1%}), tokens/step {1 + stats[1] / stats[0]:.2f}"
+                f"spec decode: accepted {stats[2]}/{stats[1]} drafts "
+                f"({stats[2] / max(stats[1], 1):.1%}), tokens/step "
+                f"{(stats[0] + stats[2]) / stats[0]:.2f}"
             )
 
-        # MTP maintenance + next draft (pairs (h_i, token_{i+1}) for accepted rows).
-        if accepted and use_graph:
-            self._spec_mtp_tokens[:1].copy_(s1)
-            self._spec_mtp_tokens[1:].copy_(s2)
-            self._spec_mtp_graph.replay()
-            self._mtp_pending[req.uid] = ("decode", int(self._spec_draft_buf.item()))
-            next_cpu = s1.to("cpu", non_blocking=True)
-            extra = (s2, s2.to("cpu", non_blocking=True))
-            ev = torch.cuda.Event()
-            ev.record(self.stream)
-            return ForwardOutput(s1, next_cpu, ev, extra)
+        # --- MTP maintenance (padded to m_max) + chain seed -------------------
+        # Rows 0..a pair (h_{p+i}, s_{i+1}); pads repeat the last real pair but
+        # write to lookahead rows (dead data, rewritten later).
+        n_rows = a + 1
+        buf["mtp_tokens"][:n_rows].copy_(sampled[: n_rows])
+        buf["mtp_tokens"][n_rows:].fill_(int(s_cpu[a]))
+        if n_rows < m_max:
+            self._spec_hidden_buf[n_rows:].copy_(
+                self._spec_hidden_buf[n_rows - 1 : n_rows].expand(m_max - n_rows, -1)
+            )
+        pad_positions = torch.arange(m_max, dtype=torch.int32, device=self.device)
+        mtp_pos = torch.where(
+            pad_positions < n_rows,
+            pad_positions + p,
+            pad_positions - n_rows + (p + n_emit),
+        )
+        buf["mtp_loc"].copy_(buf["rows"][0][mtp_pos.to(torch.int64)])
+        buf["positions"][:m_max].copy_(mtp_pos)
+        buf["mtp_kvlen"].fill_(p + n_rows + (m_max - n_rows))
+        self._spec_maint_graph.replay()
+        draft_next = int(self._spec_maint_argmax[n_rows - 1].item())
+
+        # --- chain k-1 more drafts -------------------------------------------
+        new_drafts = [draft_next]
+        buf["chain_h"].copy_(self._spec_maint_raw[n_rows - 1 : n_rows])
+        for c in range(1, self.SPEC_K):
+            q = p + n_emit + c - 1  # MTP row position of this chain token
+            buf["chain_tok"].fill_(new_drafts[-1])
+            buf["chain_loc"].copy_(buf["rows"][0, q : q + 1])
+            buf["positions"][:1].copy_(
+                torch.tensor([q], dtype=torch.int32, device=self.device)
+            )
+            buf["chain_kvlen"].fill_(q + 1)
+            self._spec_chain_graph.replay()
+            new_drafts.append(int(self._spec_chain_argmax.item()))
+        self._mtp_pending[req.uid] = ("decode", new_drafts)
+
+        # --- emit -------------------------------------------------------------
+        s1 = sampled[0:1]
+        next_cpu = s1.to("cpu", non_blocking=True)
+        extra = None
+        if n_emit > 1:
+            extra_gpu = sampled[1:n_emit]
+            extra = (extra_gpu, extra_gpu.to("cpu", non_blocking=True))
+        ev = torch.cuda.Event()
+        ev.record(self.stream)
+        return ForwardOutput(s1, next_cpu, ev, extra)
         if accepted:
             mtp_tokens = torch.cat([s1, s2])
             with self.ctx.forward_batch(mtp_batch):
@@ -1461,7 +1520,7 @@ class Engine:
             batch.attn_metadata = _md(1, p + 1)
             with self.ctx.forward_batch(batch):
                 dlog = model.mtp_draft(hidden[:1], s1)
-        self._mtp_pending[req.uid] = ("decode", int(dlog[-1].argmax().item()))
+        self._mtp_pending[req.uid] = ("decode", [int(dlog[-1].argmax().item())])
 
         next_cpu = s1.to("cpu", non_blocking=True)
         extra = None
@@ -1497,7 +1556,7 @@ class Engine:
             pending = self._mtp_pending.pop(req.uid, None)
             sampled = int(next_tokens_gpu[0].item())
             if pending is not None:
-                origin, tok = pending
+                origin, tok = pending[0], pending[1][0]
                 stats = self._mtp_stats[origin]
                 stats[0] += 1
                 stats[1] += int(tok == sampled)
@@ -1522,7 +1581,7 @@ class Engine:
             dbg[1] += int(chk == sampled)
             with self.ctx.forward_batch(batch):
                 draft_logits = model.mtp_draft(hidden, next_tokens_gpu[:1])
-            self._mtp_pending[req.uid] = ("decode", int(draft_logits[-1].argmax().item()))
+            self._mtp_pending[req.uid] = ("decode", [int(draft_logits[-1].argmax().item())])
             return
         # Prefill: MTP consumes (hidden_i, embed(token_{i+1})) for every extend
         # position -- the last pair uses the just-sampled token. Radix-cached
@@ -1541,7 +1600,7 @@ class Engine:
         )
         with self.ctx.forward_batch(batch):
             draft_logits = model.mtp_draft(model.last_hidden[:num_tokens], shifted)
-        self._mtp_pending[req.uid] = ("prefill", int(draft_logits[-1].argmax().item()))
+        self._mtp_pending[req.uid] = ("prefill", [int(draft_logits[-1].argmax().item())])
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

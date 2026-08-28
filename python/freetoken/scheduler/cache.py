@@ -638,32 +638,45 @@ class CacheManager:
     # scheduler allocates that page right before the forward and frees it again
     # when the draft is rejected, so on accept the layout is indistinguishable
     # from a vanilla step and every existing alloc/free/caching invariant holds.
-    def allocate_spec_lookahead(self, req: Req) -> None:
+    def allocate_spec_lookahead(self, req: Req, n: int = 1) -> None:
+        """Allocate ``n`` pages for positions [device_len, device_len + n): the
+        verify draft tokens' KV rows plus the chain drafts' MTP rows. The
+        partner ``free_spec_lookahead`` trims back to the post-step device_len,
+        so the allocator's positions-below-device_len invariant always holds
+        between steps."""
         assert self.page_size == 1, "spec lookahead assumes page_size == 1"
         assert getattr(req, "spec_lookahead_pos", None) is None, (
             f"unreleased spec lookahead at {req.spec_lookahead_pos}"
         )
-        pos = req.device_len  # the verify (draft) token's position
-        page = self._allocate(1)
-        self.page_table[req.table_idx, pos] = page[0]
-        req.spec_lookahead_pos = pos
+        pos = req.device_len
+        pages = self._allocate(n)
+        self.page_table[req.table_idx, pos : pos + n] = pages
+        req.spec_lookahead_pos = (pos, pos + n)
         if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
             logger.info_rank0(
-                f"spec page: alloc pos={pos} page={int(page[0])} "
-                f"free={len(self.free_slots)}"
+                f"spec page: alloc [{pos},{pos + n}) free={len(self.free_slots)}"
             )
 
     def free_spec_lookahead(self, req: Req) -> None:
-        pos = getattr(req, "spec_lookahead_pos", None)
-        if pos is None:
+        """Trim the lookahead back to the request's CURRENT device_len: pages
+        for positions the step actually consumed become normal pages, the rest
+        return to the pool."""
+        span = getattr(req, "spec_lookahead_pos", None)
+        if span is None:
             return
-        self._free(self.page_table[req.table_idx, pos : pos + 1])
+        start, end = span
+        # Keep only the CONSUMED positions (< cached_len). Position cached_len
+        # (= device_len - 1, the next step's input) must return to the pool --
+        # the next allocate_paged covers [cached_len, device_len) itself, and
+        # keeping it here would orphan the old page when that alloc re-points
+        # the row (measured: one leaked page per accepting step).
+        keep_upto = max(start, min(req.cached_len, end))
+        if end > keep_upto:
+            self._free(self.page_table[req.table_idx, keep_upto:end])
         req.spec_lookahead_pos = None
         if os.environ.get("FREETOKEN_GLM_SPEC_DEBUG", "") == "1":
             logger.info_rank0(
-                f"spec page: free pos={pos} "
-                f"page={int(self.page_table[req.table_idx, pos])} "
-                f"free={len(self.free_slots)}"
+                f"spec page: trim [{keep_upto},{end}) free={len(self.free_slots)}"
             )
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:

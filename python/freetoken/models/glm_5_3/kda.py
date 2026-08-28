@@ -142,12 +142,14 @@ class Glm53KDA(BaseOP):
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self.lower_bound,
                 )
-                if j == 0:
-                    # index_select keeps this host-sync-free (slot is a device tensor)
-                    pool.spec_mid_conv[li].copy_(
+                if j < m - 1:
+                    # Stash the state after EVERY non-final token: a rejected
+                    # chain rolls back to the state after the last ACCEPTED one.
+                    # index_select keeps this host-sync-free (slot is device).
+                    pool.spec_mid_conv[j][li].copy_(
                         pool.conv_states[li].index_select(0, slot)
                     )
-                    pool.spec_mid_rec[li].copy_(
+                    pool.spec_mid_rec[j][li].copy_(
                         pool.recurrent_states[li].index_select(0, slot)
                     )
                 outs.append(out_j.view(1, self.num_heads, self.head_dim))

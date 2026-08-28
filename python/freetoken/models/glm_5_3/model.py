@@ -146,7 +146,7 @@ class Glm53MTPLayer(BaseOP):
         x = x + self.self_attn.forward(y)
         y = self.post_attention_layernorm.forward(x)
         x = x + self.mlp.forward(y)
-        return self.shared_head_norm.forward(x)
+        return x  # raw block output; caller applies shared_head_norm for logits
 
 
 class Glm53Model(BaseOP):
@@ -207,10 +207,14 @@ class Glm5NextForConditionalGeneration(BaseLLMModel):
         """Draft logits: MTP block over (main hidden at the batch's positions,
         embedding of the tokens sampled for the NEXT positions). Runs inside the
         same forward-batch ctx as the main pass -- the MTP layer's KV row is
-        written at the same out_loc, and its attention reads the same metadata."""
+        written at the same out_loc, and its attention reads the same metadata.
+        ``last_mtp_hidden`` stashes the block output BEFORE shared_head_norm:
+        chained drafting feeds it back as the next iteration's previous hidden
+        (the deepseek-MTP recurrence)."""
         emb = self.model.embed_tokens.forward(token_ids)
         out = self.model.mtp.forward(hidden, emb)
-        return self.lm_head.forward(out)
+        self.last_mtp_hidden = out
+        return self.lm_head.forward(self.model.mtp.shared_head_norm.forward(out))
 
 
 __all__ = ["Glm5NextForConditionalGeneration"]
