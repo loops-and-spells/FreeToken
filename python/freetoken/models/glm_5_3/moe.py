@@ -9,10 +9,12 @@ expert is a block-fp8 dense MLP.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn.functional as F
+from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
 
 from .mlp import Glm53GatedMLP
@@ -47,6 +49,29 @@ class Glm53SparseBlock(BaseOP):
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
         )
+        # AcceptMoE-style residency-biased routing (arXiv 2608.02989): at
+        # DECODE, restrict host-cache layers' expert eligibility to what is
+        # already cache-resident, killing the per-step PCIe miss traffic for a
+        # small distribution shift. Skipped for device-bank layers (their full
+        # expert set is resident) and whenever too few experts are resident.
+        self._resident_bias = os.environ.get("FREETOKEN_MOE_RESIDENT_BIAS", "") == "1"
+
+    def _resident_mask(self) -> torch.Tensor | None:
+        """[num_experts] bool eligibility, or None when masking must not apply
+        (prefill, no cache attached, device/cpu layer). Tensor-only math so the
+        captured decode/verify graphs replay it with live residency."""
+        cache = getattr(self.experts, "offload_cache", None)
+        if cache is None:
+            return None
+        batch = get_global_ctx().batch
+        if not (batch is not None and batch.is_decode):
+            return None
+        lid = self.experts.layer_id
+        if lid in cache.device_bank_layer_ids or cache.is_cpu_layer(lid):
+            return None
+        resident = cache.slot_for_id[lid] >= 0  # [E] bool, live under graphs
+        enough = resident.sum() >= (self.top_k * 4)
+        return resident | ~enough
 
     def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
         m = scores_for_choice.shape[0]
@@ -65,6 +90,10 @@ class Glm53SparseBlock(BaseOP):
         scores_for_choice = scores + self.e_score_correction_bias.float()
         if self.n_group > 1:
             scores_for_choice = self._group_limited(scores_for_choice)
+        if self._resident_bias:
+            mask = self._resident_mask()
+            if mask is not None:
+                scores_for_choice = scores_for_choice.masked_fill(~mask, float("-inf"))
         _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)
         topk_weights = scores.gather(-1, topk_ids)
         if self.norm_topk_prob:
