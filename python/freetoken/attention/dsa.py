@@ -35,6 +35,9 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .dsa_indexer import DSAIndexerMixin
@@ -122,6 +125,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         # decode staging (static buffers under CUDA graphs; eager decode builds
         # per-forward tensors in prepare_metadata instead)
         self._rows_buf: torch.Tensor | None = None
+        # cached pooled-key slab (see init_capture_graph); owner = req uid whose
+        # pools it currently holds. _ape_stash: per-layer-slot compress_ape
+        # params, captured on first decode use so host-side refills can re-pool.
+        self._pooled_slab: torch.Tensor | None = None
+        self._pooled_owner: int | None = None
+        self._ape_stash: Dict[int, torch.Tensor] = {}
         self._kvlen_buf: torch.Tensor | None = None
         self.max_seq_len = 0
         self.capture_bs: List[int] = []
@@ -245,12 +254,71 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         return torch.cat([tokens, tail.to(tokens.dtype)], dim=-1)
 
     # ----- decode (CUDA-graph capturable, single code path) -----------------------------
+    def ensure_pooled_slab(self, uid: int, row: torch.Tensor, kv_len: int) -> None:
+        """Host-side, before a bs==1 kpool decode/verify forward: refill the
+        pooled-key slab when the running request changed (one full re-pool --
+        the cost the per-step path used to pay EVERY step). Incremental per-step
+        updates inside the captured forward keep it current afterwards."""
+        if self._pooled_slab is None or self._pooled_owner == uid:
+            return
+        self._pooled_owner = uid
+        kp = self.index_kpool
+        valid_pools = kv_len // kp
+        if valid_pools <= 0 or not self._ape_stash:
+            return
+        rows1 = row.view(1, -1)
+        for layer_id, slot in self._idx_slot.items():
+            ape = self._ape_stash.get(slot)
+            if ape is None:
+                continue
+            pooled = self._kpool_pooled_keys(slot, rows1, valid_pools, ape)
+            self._pooled_slab[slot, :valid_pools].copy_(
+                pooled[0].to(self._pooled_slab.dtype)
+            )
+
+    def _kpool_update_slab(self, slot, rows, kvlen, ape, m: int) -> None:
+        """Incrementally re-pool the (<= m) pools touched by this step's new
+        tokens (positions kvlen-m .. kvlen-1). Static shapes and device-only
+        math, so it captures into the decode/verify graphs. A rejected verify
+        token's contribution self-heals: the next step re-pools the same
+        position with the corrected row."""
+        kp = self.index_kpool
+        slab = self._pooled_slab[slot]
+        keys_cache = self.kvcache.index_k_cache(slot)
+        gate_cache = self.kvcache.index_gate_cache(slot)
+        arange_kp = torch.arange(kp, device=rows.device)
+        for j in range(m):
+            pos = (kvlen - 1 - j).clamp_min(0)  # [1]
+            pool_id = torch.div(pos, kp, rounding_mode="floor")  # [1]
+            member_pos = (pool_id * kp).view(1, 1) + arange_kp.view(1, kp)  # [1, kp]
+            gathered = rows.gather(1, member_pos.clamp(max=rows.shape[1] - 1).long())
+            gathered = gathered.clamp_min(0).long()
+            keys = keys_cache[gathered].reshape(1, kp, -1).float()  # [1, kp, D]
+            gates = gate_cache[gathered].reshape(1, kp, -1).float()
+            valid = (member_pos < kvlen.view(1, 1)).unsqueeze(-1)
+            # Broadcast ape EXACTLY like _kpool_pooled_keys does against the
+            # 4D [bs, P, kp, D] view -- shape-agnostic to ape's layout.
+            logits = (
+                (gates.view(1, 1, kp, -1) + ape.float()[None, None])
+                .view(1, kp, -1)
+                .masked_fill(~valid, float("-inf"))
+            )
+            weights = torch.softmax(logits, dim=1)
+            pooled = (weights * keys).sum(dim=1)  # [1, D]
+            slab.index_copy_(0, pool_id.long(), pooled.to(slab.dtype))
+
     def _decode_select_kpool(self, md, layer_id, q_idx, w, ape) -> tuple:
         rows, kvlen = md.rows, md.kvlen
         bs = rows.shape[0]
         kp = self.index_kpool
         num_pools = rows.shape[1] // kp
-        pooled = self._kpool_pooled_keys(self._idx_slot[layer_id], rows, num_pools, ape)
+        slot = self._idx_slot[layer_id]
+        if getattr(self, "_pooled_slab", None) is not None and bs == 1:
+            self._ape_stash[slot] = ape
+            self._kpool_update_slab(slot, rows, kvlen, ape, getattr(md, "spec_m", 1))
+            pooled = self._pooled_slab[slot][None, :num_pools].float()
+        else:
+            pooled = self._kpool_pooled_keys(slot, rows, num_pools, ape)
         # head-reduced pool logits: sum_h w_h * relu(q_h . pooled_k_p), fp32
         logits = torch.relu(torch.einsum("bhd,bpd->bhp", q_idx.float(), pooled))
         s = (logits * (w.float() * self.index_scale).unsqueeze(-1)).sum(dim=1)  # [bs, P]
@@ -468,6 +536,17 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         width = get_global_ctx().page_table.shape[1]
         self._rows_buf = torch.full((max_bs, width), -1, dtype=torch.int32, device=self.device)
         self._kvlen_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+        if self.dsa_enabled and self.index_kpool > 1 and self._idx_slot:
+            # Cached pooled-key slab (bs==1 decode path): full-width re-pooling
+            # every step scales with TABLE width (~5 tok/s per 128k measured);
+            # the slab is filled once per request (ensure_pooled_slab) and
+            # updated incrementally per step. Allocated here so every captured
+            # graph bakes the slab read.
+            d_idx = self.kvcache.index_k_cache(0)[0].numel()
+            self._pooled_slab = torch.zeros(
+                len(self._idx_slot), width // self.index_kpool, d_idx,
+                dtype=torch.bfloat16, device=self.device,
+            )
 
     def _decode_rows(self, batch: Batch) -> torch.Tensor:
         """This decode step's per-request page-table rows [bs, W], gathered off the

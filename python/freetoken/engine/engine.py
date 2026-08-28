@@ -1123,6 +1123,17 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if (
+            batch.is_decode
+            and batch.size == 1
+            and hasattr(self.attn_backend, "ensure_pooled_slab")
+        ):
+            # Refill the pooled-key slab when the running request changed (the
+            # captured graphs bake the slab read; the refill is host-side).
+            req0 = batch.reqs[0]
+            self.attn_backend.ensure_pooled_slab(
+                req0.uid, self.ctx.page_table[req0.table_idx], req0.device_len
+            )
         if self.spec_will_verify(batch):
             return self._spec_forward(
                 batch, args, self._mtp_pending[batch.reqs[0].uid][1]
