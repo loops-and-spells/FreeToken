@@ -785,7 +785,11 @@ class Engine:
                 if os.environ.get("FREETOKEN_PEER_EXPERT_COMPUTE", "") == "1":
                     cache.peer_compute = True
                     cache.peer_max_tokens = max(
-                        config.max_running_req, config.cuda_graph_max_bs or 0, 1
+                        config.max_running_req,
+                        config.cuda_graph_max_bs or 0,
+                        # spec verify pushes m = SPEC_K + 1 rows through the layers
+                        self.SPEC_K + 1,
+                        1,
                     )
                     logger.info_rank0(
                         "peer expert compute: device-bank layers decode on their "
@@ -1399,22 +1403,26 @@ class Engine:
         req = batch.reqs[0]
         model = self.model
         self._mtp_pending.pop(req.uid, None)
-        p = int(batch.positions[0].item())
+        p = req.device_len - 1  # host-tracked; no device sync
         m = len(drafts) + 1
         m_max = self.SPEC_K + 1
         buf = self._spec_buf
+        dev = self.device
+        drafts_gpu = (
+            drafts
+            if isinstance(drafts, torch.Tensor)
+            else torch.tensor(drafts, dtype=torch.int32, device=dev)
+        )
 
         slot_idx = batch.linear_table_idx
         if slot_idx is None:
             slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-            slot_idx = torch.tensor([slot], dtype=torch.int32, device=self.device)
+            slot_idx = torch.tensor([slot], dtype=torch.int32, device=dev)
 
         # --- verify ---------------------------------------------------------
         buf["input_ids"][:1].copy_(batch.input_ids)
-        buf["input_ids"][1:m].copy_(
-            torch.tensor(drafts, dtype=torch.int32, device=self.device)
-        )
-        pos_row = torch.arange(m, dtype=torch.int32, device=self.device) + p
+        buf["input_ids"][1:m].copy_(drafts_gpu)
+        pos_row = torch.arange(m, dtype=torch.int32, device=dev) + p
         buf["positions"][:m].copy_(pos_row)
         buf["slot"].copy_(slot_idx)
         buf["rows"].copy_(self.ctx.page_table[req.table_idx : req.table_idx + 1])
@@ -1423,17 +1431,20 @@ class Engine:
         self._spec_graphs[m].replay()
         logits = self._spec_logits_buf
 
-        # --- sample all rows, accept the longest prefix ----------------------
+        # --- sample all rows; accept count computed on-device (ONE sync) -----
         sampled = torch.cat(
             [self.sampler.sample(logits[i : i + 1], args) for i in range(m)]
         ).to(torch.int32)
-        s_cpu = sampled.tolist()  # one sync
-        eos = getattr(self, "spec_eos_token_ids", ())
-        a = 0
-        for i in range(m - 1):
-            if s_cpu[i] != drafts[i] or s_cpu[i] in eos:
-                break
-            a += 1
+        eos_gpu = getattr(self, "_spec_eos_gpu", None)
+        if eos_gpu is None:
+            eos_gpu = self._spec_eos_gpu = torch.tensor(
+                sorted(getattr(self, "spec_eos_token_ids", ())) or [-1],
+                dtype=torch.int32, device=dev,
+            )
+        ok = (sampled[: m - 1] == drafts_gpu) & ~torch.isin(
+            sampled[: m - 1], eos_gpu
+        )
+        a = int(torch.cumprod(ok.to(torch.int32), 0).sum().item())
         n_emit = a + 1  # s_1..s_{a+1}; the last is the bonus from row a
         for _ in range(n_emit):
             req.complete_one()
@@ -1456,13 +1467,13 @@ class Engine:
         # Rows 0..a pair (h_{p+i}, s_{i+1}); pads repeat the last real pair but
         # write to lookahead rows (dead data, rewritten later).
         n_rows = a + 1
-        buf["mtp_tokens"][:n_rows].copy_(sampled[: n_rows])
-        buf["mtp_tokens"][n_rows:].fill_(int(s_cpu[a]))
+        buf["mtp_tokens"][:n_rows].copy_(sampled[:n_rows])
         if n_rows < m_max:
+            buf["mtp_tokens"][n_rows:].copy_(sampled[a : a + 1].expand(m_max - n_rows))
             self._spec_hidden_buf[n_rows:].copy_(
                 self._spec_hidden_buf[n_rows - 1 : n_rows].expand(m_max - n_rows, -1)
             )
-        pad_positions = torch.arange(m_max, dtype=torch.int32, device=self.device)
+        pad_positions = torch.arange(m_max, dtype=torch.int32, device=dev)
         mtp_pos = torch.where(
             pad_positions < n_rows,
             pad_positions + p,
@@ -1470,23 +1481,21 @@ class Engine:
         )
         buf["mtp_loc"].copy_(buf["rows"][0][mtp_pos.to(torch.int64)])
         buf["positions"][:m_max].copy_(mtp_pos)
-        buf["mtp_kvlen"].fill_(p + n_rows + (m_max - n_rows))
+        buf["mtp_kvlen"].fill_(p + m_max)
         self._spec_maint_graph.replay()
-        draft_next = int(self._spec_maint_argmax[n_rows - 1].item())
 
-        # --- chain k-1 more drafts -------------------------------------------
-        new_drafts = [draft_next]
+        # --- chain k-1 more drafts, fully device-side -------------------------
+        new_drafts = torch.empty(self.SPEC_K, dtype=torch.int32, device=dev)
+        new_drafts[0:1].copy_(self._spec_maint_argmax[n_rows - 1 : n_rows])
         buf["chain_h"].copy_(self._spec_maint_raw[n_rows - 1 : n_rows])
         for c in range(1, self.SPEC_K):
             q = p + n_emit + c - 1  # MTP row position of this chain token
-            buf["chain_tok"].fill_(new_drafts[-1])
+            buf["chain_tok"].copy_(new_drafts[c - 1 : c])
             buf["chain_loc"].copy_(buf["rows"][0, q : q + 1])
-            buf["positions"][:1].copy_(
-                torch.tensor([q], dtype=torch.int32, device=self.device)
-            )
+            buf["positions"][:1].fill_(q)
             buf["chain_kvlen"].fill_(q + 1)
             self._spec_chain_graph.replay()
-            new_drafts.append(int(self._spec_chain_argmax.item()))
+            new_drafts[c : c + 1].copy_(self._spec_chain_argmax)
         self._mtp_pending[req.uid] = ("decode", new_drafts)
 
         # --- emit -------------------------------------------------------------

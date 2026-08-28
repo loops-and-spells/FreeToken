@@ -277,6 +277,32 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
+            if os.environ.get("FREETOKEN_STEP_TIMING", "") == "1" and not forward_input.batch.is_prefill:
+                import time as _time
+
+                torch.cuda.synchronize()
+                t0 = _time.perf_counter()
+                fo = self._forward(forward_input)
+                torch.cuda.synchronize()
+                t1 = _time.perf_counter()
+                ongoing_data = (forward_input, fo)
+                self._process_last_data(ongoing_data)
+                t2 = _time.perf_counter()
+                self._flush_abort_acks()
+                acc = getattr(self, "_step_t", None)
+                if acc is None:
+                    acc = self._step_t = [0.0, 0.0, 0]
+                acc[0] += t1 - t0
+                acc[1] += t2 - t1
+                acc[2] += 1
+                if acc[2] % 100 == 0:
+                    logger.info(
+                        f"step timing: forward {acc[0] / acc[2] * 1e3:.1f}ms "
+                        f"drain {acc[1] / acc[2] * 1e3:.1f}ms over {acc[2]} steps"
+                    )
+                    acc[0] = acc[1] = 0.0
+                    acc[2] = 0
+                return
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
